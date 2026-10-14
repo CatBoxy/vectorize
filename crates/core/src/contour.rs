@@ -205,16 +205,18 @@ fn classify_turns(dirs: &[u8]) -> Turns {
         let (_, d_d, len_d) = runs[(i + 3) % q];
         let (_, d_before_a, len_before_a) = runs[(i + q - 1) % q];
         let last_a = (start_a + len_a - 1) % n;
-        if q >= 4 && len_b == 1 && len_c == 1 && d_b == d_d && d_c == d_a && len_a >= 2 && len_d >= 2 {
+        // Runs must be at least `LONG` steps; see `chain::classify_turns`.
+        let long = crate::chain::LONG;
+        if q >= 4 && len_b == 1 && len_c == 1 && d_b == d_d && d_c == d_a && len_a >= long && len_d >= long {
             t.skip[start_b] = true;
             t.skip[start_c] = true;
             t.chamfer_after[last_a] = true;
             t.genuine[last_a] = true;
             continue;
         }
-        t.genuine[last_a] = (len_a >= 2 && len_b >= 2)
-            || (d_c == (d_a + 2) % 4 && len_a >= 2 && len_c >= 2)
-            || (d_before_a == (d_b + 2) % 4 && len_b >= 2 && len_before_a >= 2);
+        t.genuine[last_a] = (len_a >= long && len_b >= long)
+            || (d_c == (d_a + 2) % 4 && len_a >= long && len_c >= long)
+            || (d_before_a == (d_b + 2) % 4 && len_b >= long && len_before_a >= long);
     }
     t
 }

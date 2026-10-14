@@ -11,6 +11,7 @@ mod metrics;
 mod raster_svg;
 mod report;
 mod run;
+mod seams;
 mod svgstat;
 mod tracers;
 

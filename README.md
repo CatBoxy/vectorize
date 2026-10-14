@@ -39,9 +39,16 @@ cargo run --release -p vectorize-cli -- in.png -o out.svg --stats
 cargo run --release -p vectorize-cli -- in.png --params '{"tolerance":0.2,"fit_accuracy":0.2,"curve_fit":"kurbo"}'
 ```
 
-`--stats` prints node counts and per-stage milliseconds. `VECTORIZE_DEBUG=1` (or `=elbows`) prints what the
-contour and polygon stages did for every loop. `curve_fit` is `kurbo` (default: fit the dense sub-pixel
-contour between corners) or `potrace` (Selinger's smooth + opticurve on the polygon), kept for comparison.
+`--stats` prints node counts and per-stage milliseconds. `mode` is `color` (default), `grayscale` or
+`black_and_white`; `method` is `abutting` (default: adjacent shapes share one fitted boundary, one path per
+colour) or `overlapping` (stacked: each shape painted over what encloses it, fewer nodes); `colors` caps
+the palette; `ignore_background` drops the border-majority colour. `curve_fit` is `kurbo` (default: fit
+the dense sub-pixel contour between corners) or `potrace` (Selinger's smooth + opticurve on the polygon),
+kept for comparison.
+
+Debugging: `VECTORIZE_DEBUG=1` prints a summary per stage; `=elbows`, `=chains`, `=edges`, `=stack` and
+`=trace` print the contour points, boundary chains, per-edge fit counts, stacking order and fitter calls;
+`VECTORIZE_PROBE=x,y` prints the colour mix of the pixels around a point.
 
 ## Windows notes
 
