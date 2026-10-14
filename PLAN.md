@@ -321,6 +321,39 @@ resvg used as a crate, not a CLI; open-vectorizer baseline pending). Step 8 (Are
 Baselines live in bench/baselines.json; VTracer is fed white-flattened inputs because it reads
 transparent pixels as black.
 
+Status 2026-10-14: M1 exit criterion met on the bw corpus (835 images, defaults):
+
+| size | ΔE ours | ΔE Potrace | nodes ours | nodes Potrace | ms ours (in-process) |
+|---|---|---|---|---|---|
+| 64 | 1.01 | 1.98 | 34.2 | 35.4 | 2.9 |
+| 128 | 0.46 | 0.98 | 35.9 | 44.6 | 5.0 |
+| 256 | 0.23 | 0.51 | 39.4 | 54.0 | 6.8 |
+| 512 | 0.12 | 0.24 | 44.2 | 64.0 | 12.4 |
+| 1024 | 0.06 | 0.12 | 50.2 | 75.7 | 33.5 |
+
+`bench compare potrace ours` passes (it reads bench/baselines.json when no potrace run exists). The
+worst bw images are all 64 px JPEGs with ringing specks and the Starbucks logo; the colour and
+synthetic sets are traced as black and white until M2 and score accordingly.
+
+What M1 ended up as, and where it departs from the recipe above:
+- Boundary: Potrace path decomposition for topology, then one sub-pixel point per pixel step by
+  one-dimensional area matching of the two coverages across the edge (exact for a straight edge at
+  any angle), plus an elbow at every turn. Single-step chamfers at anti-aliased 90° corners are
+  repaired to the intersection of the two edge lines. Full Manson 2010 contouring was not needed.
+- Polygon: Potrace's optimal polygon on real coordinates with tolerance 0.2 px, without the
+  `i-1..j+1` extension (it forbids a vertex on an anti-aliased corner), on measured points and real
+  corners only, with cut-corner vertex pairs merged. Vertex adjustment box 1.5 px.
+- Corners: Potrace alpha on the polygon, plus any point where the contour turns > 60° within ±1 px
+  of arc. Known gap: 1 px notches at thin-line ends round the ends; Potrace alpha misses corners
+  whose adjacent edges are short. Both are M3 (corner model) work.
+- Fit: kurbo `fit_to_cubic` driven by a greedy exponential/binary search per segment, with the
+  fitted cubic re-checked against the samples and sane-control-point guards (kurbo returns wild
+  arms on nearly straight data). `fit_to_bezpath_opt` was 100× slower and could hang. Fit accuracy
+  0.35 px: 0.3 gives ΔE 0.94 @64 but 36.0 nodes (Potrace 35.4); 0.4 gives 32.8 nodes at ΔE 1.08.
+  Straight runs become lines. The ported Potrace smooth+opticurve stays behind
+  `curve_fit: "potrace"` for comparison (more nodes above 128 px, worse ΔE everywhere).
+- Output: one path per image, nonzero winding, consecutive corners joined by single lines.
+
 
 1. `rustup update`; `cargo install wasm-pack vtracer resvg`; `sudo apt install potrace`.
 2. `cargo new --lib crates/core`, workspace Cargo.toml, `cargo add kurbo` in core.

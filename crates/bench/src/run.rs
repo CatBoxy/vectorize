@@ -214,10 +214,38 @@ fn print_summary(r: &Results) {
     }
 }
 
+/// Load `bench/out/<name>.json`, or, when there is no such run, the entry
+/// of that name in `bench/baselines.json` (buckets only, no rows), so the
+/// regression gate works on a machine without the baseline tracers.
 pub fn load(root: &Path, name: &str) -> Result<Results> {
     let p = if name.ends_with(".json") { root.join(name) } else { root.join("bench/out").join(format!("{name}.json")) };
-    let s = fs::read_to_string(&p).with_context(|| p.display().to_string())?;
-    Ok(serde_json::from_str(&s)?)
+    if p.is_file() {
+        let s = fs::read_to_string(&p).with_context(|| p.display().to_string())?;
+        return Ok(serde_json::from_str(&s)?);
+    }
+    let bp = root.join("bench/baselines.json");
+    let s = fs::read_to_string(&bp).with_context(|| format!("{} and {}", p.display(), bp.display()))?;
+    let all: BTreeMap<String, Baseline> = serde_json::from_str(&s)?;
+    let b = all
+        .get(name)
+        .with_context(|| format!("no run {} and no baseline {name} in {}", p.display(), bp.display()))?;
+    Ok(Results {
+        name: name.to_string(),
+        tracer: b.tracer.clone(),
+        params: None,
+        date: b.date.clone(),
+        in_process: false,
+        rows: Vec::new(),
+        buckets: b.buckets.clone(),
+    })
+}
+
+/// One entry of `bench/baselines.json`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Baseline {
+    pub date: String,
+    pub tracer: String,
+    pub buckets: BTreeMap<String, Bucket>,
 }
 
 fn rel(root: &Path, p: &Path) -> String {
