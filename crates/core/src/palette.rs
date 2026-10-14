@@ -105,6 +105,10 @@ pub fn oklab_to_srgb(c: Lab) -> [u8; 3] {
 /// How far (sRGB, 0..255 scale) a pixel may sit from the segment between
 /// two palette colours and still count as a mix of them.
 pub const RGB_MIX_TOL: f32 = 28.0;
+/// What shows through the seam between abutting shapes when they were
+/// rasterized on an opaque canvas: white, unless the image has a detected
+/// background colour.
+pub const CANVAS: [u8; 3] = [255, 255, 255];
 
 #[derive(Clone, Debug)]
 pub struct PaletteOpts {
@@ -177,6 +181,67 @@ pub fn project_rgb(a: [u8; 3], b: [u8; 3], p: [u8; 3]) -> (f32, f32) {
     let t = if len2 < 1e-6 { 0.0 } else { ((v[0] * d[0] + v[1] * d[1] + v[2] * d[2]) / len2).clamp(0.0, 1.0) };
     let r = [v[0] - t * d[0], v[1] - t * d[1], v[2] - t * d[2]];
     (t, (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt())
+}
+
+/// Barycentric weights of the point in the sRGB triangle `a, b, c` nearest
+/// to `p`, and the residual distance. The weights are non-negative and sum
+/// to one; a point outside the triangle lands on its nearest edge.
+pub fn project_tri_rgb(a: [u8; 3], b: [u8; 3], c: [u8; 3], p: [u8; 3]) -> ([f32; 3], f32) {
+    let f = |v: [u8; 3]| [v[0] as f32, v[1] as f32, v[2] as f32];
+    let (a, b, c, p) = (f(a), f(b), f(c), f(p));
+    let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let q = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+    let dot = |x: [f32; 3], y: [f32; 3]| x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+    let (uu, uv, vv, qu, qv) = (dot(u, u), dot(u, v), dot(v, v), dot(q, u), dot(q, v));
+    let det = uu * vv - uv * uv;
+    let (s, t) = if det.abs() < 1e-6 { (-1.0, -1.0) } else { ((qu * vv - qv * uv) / det, (qv * uu - qu * uv) / det) };
+    let weights = if s >= 0.0 && t >= 0.0 && s + t <= 1.0 {
+        [1.0 - s - t, s, t]
+    } else {
+        // Nearest edge.
+        let ab = project_rgb(a.map(|x| x as u8), b.map(|x| x as u8), p.map(|x| x as u8));
+        let ac = project_rgb(a.map(|x| x as u8), c.map(|x| x as u8), p.map(|x| x as u8));
+        let bc = project_rgb(b.map(|x| x as u8), c.map(|x| x as u8), p.map(|x| x as u8));
+        if ab.1 <= ac.1 && ab.1 <= bc.1 {
+            [1.0 - ab.0, ab.0, 0.0]
+        } else if ac.1 <= bc.1 {
+            [1.0 - ac.0, 0.0, ac.0]
+        } else {
+            [0.0, 1.0 - bc.0, bc.0]
+        }
+    };
+    let mut r = 0.0;
+    for k in 0..3 {
+        let m = weights[0] * a[k] + weights[1] * b[k] + weights[2] * c[k];
+        r += (p[k] - m) * (p[k] - m);
+    }
+    (weights, r.sqrt())
+}
+
+/// Coverage of `b` against `a` in a *conflation* pixel: two abutting
+/// shapes anti-aliased separately over the canvas, so the pixel is a mix
+/// of `a`, `b` and the canvas with weights `w`. The shape painted last
+/// keeps its exact coverage; the one under it shows through the rest. The
+/// painting order is the hypothesis whose two coverages sum closest to one.
+pub fn conflation_t(w: [f32; 3]) -> f32 {
+    let (wa, wb, ww) = (w[0], w[1], w[2]);
+    // The shape underneath covers its share of what the top one left.
+    let under = |x: f32, y: f32| if x + y > 1e-3 { x / (x + y) } else { 0.5 };
+    let (ca, cb_under) = (wa, under(wb, ww));
+    let (cb, ca_under) = (wb, under(wa, ww));
+    let a_on_top = (ca + cb_under - 1.0).abs() <= (cb + ca_under - 1.0).abs();
+    // Coverage of `b` from the top shape (exact) and from the one under it
+    // (noisy when little of the pixel was left to it), weighted by that
+    // remainder.
+    let t = if a_on_top {
+        let l = 1.0 - ca;
+        (1.0 - ca) * (1.0 - l) + cb_under * l
+    } else {
+        let l = 1.0 - cb;
+        cb * (1.0 - l) + (1.0 - ca_under) * l
+    };
+    t.clamp(0.0, 1.0)
 }
 
 pub fn dist_rgb(a: [u8; 3], b: [u8; 3]) -> f32 {
@@ -315,7 +380,12 @@ pub fn estimate(img: &Raster, an: &Analysis, o: &PaletteOpts) -> Palette {
     // are added.
     // One colour is added per round, the most populous, because adding
     // black explains every grey between black and white at once.
+    // In an opaque image, a pixel in the sRGB triangle of two colours and
+    // the canvas is a conflation pixel (abutting shapes anti-aliased
+    // separately show the canvas through the seam), not a colour of its
+    // own. Over a transparent canvas the seam shows as partial alpha.
     let far = 2.0 * o.merge_dist;
+    let canvas = if an.alpha.iter().all(|&a| a >= 128) { Some(CANVAS) } else { None };
     let edge_px: Vec<usize> = (0..n).filter(|&i| an.alpha[i] >= 253 && !an.interior[i]).collect();
     let opaque = (0..n).filter(|&i| an.alpha[i] >= 253).count();
     let min_w = ((opaque as f32 * 0.002) as u32).max(8);
@@ -327,8 +397,12 @@ pub fn estimate(img: &Raster, an: &Analysis, o: &PaletteOpts) -> Palette {
             let p = an.lab[i];
             let prgb = an.rgb[i];
             let near = centers.iter().any(|c| c.dist(p) < far)
-                || (0..crgb.len())
-                    .any(|a| (a + 1..crgb.len()).any(|b| project_rgb(crgb[a], crgb[b], prgb).1 < RGB_MIX_TOL));
+                || (0..crgb.len()).any(|a| {
+                    (a + 1..crgb.len()).any(|b| {
+                        project_rgb(crgb[a], crgb[b], prgb).1 < RGB_MIX_TOL
+                            || canvas.is_some_and(|w| project_tri_rgb(crgb[a], crgb[b], w, prgb).1 < RGB_MIX_TOL)
+                    })
+                });
             if near {
                 continue;
             }

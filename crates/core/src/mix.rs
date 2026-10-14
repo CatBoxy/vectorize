@@ -8,7 +8,7 @@
 //! (label 0). The coverage planes the contour stage reads are derived from
 //! this without storing one plane per colour.
 
-use crate::palette::{dist_rgb, project_rgb, Analysis, Palette};
+use crate::palette::{conflation_t, dist_rgb, project_rgb, project_tri_rgb, Analysis, Palette, CANVAS, RGB_MIX_TOL};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Mix {
@@ -70,6 +70,34 @@ pub fn unmix(an: &Analysis, pal: &Palette) -> MixMap {
     }
     // Nearest colour for every opaque pixel.
     let nearest: Vec<u16> = (0..n).map(|i| if an.alpha[i] == 0 { 0 } else { pal.nearest(an.lab[i]) }).collect();
+    // The canvas that shows through a seam between abutting shapes, when
+    // the image is opaque: its background colour, else white.
+    let canvas = if an.alpha.iter().all(|&a| a >= 128) {
+        Some(match pal.background {
+            Some(b) if b > 0 => pal.rgb[b as usize],
+            _ => CANVAS,
+        })
+    } else {
+        None
+    };
+    // Is there real transparency within two pixels? A partially transparent
+    // pixel with none nearby is a *conflation* pixel: the renderer
+    // anti-aliased two abutting shapes separately and their coverages did
+    // not sum to one. Its colour is still a mix of the two neighbours.
+    let near_transparent = |x: usize, y: usize| -> bool {
+        for dy in -2i32..=2 {
+            for dx in -2i32..=2 {
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                if nx < 0 || ny < 0 || nx as usize >= w || ny as usize >= h {
+                    return true;
+                }
+                if an.alpha[ny as usize * w + nx as usize] < 128 {
+                    return true;
+                }
+            }
+        }
+        false
+    };
     for y in 0..h {
         for x in 0..w {
             let i = y * w + x;
@@ -79,7 +107,7 @@ pub fn unmix(an: &Analysis, pal: &Palette) -> MixMap {
                 continue;
             }
             let n1 = nearest[i];
-            if an.alpha[i] < 253 {
+            if an.alpha[i] < 253 && near_transparent(x, y) {
                 // Partially transparent: the colour part snaps to one colour.
                 mix[i] = Mix { a: 0, b: n1, t: a };
                 continue;
@@ -113,12 +141,15 @@ pub fn unmix(an: &Analysis, pal: &Palette) -> MixMap {
                     }
                 }
             }
+            // The pixel's own nearest colour is always a candidate: at a
+            // tangency the colour it mostly is may have no interior pixel
+            // within reach, and projecting onto the wrong pair relabels it.
+            if !cands[..nc].contains(&n1) && nc < cands.len() - 1 {
+                cands[nc] = n1;
+                nc += 1;
+            }
             if nc < 2 {
-                if !cands[..nc].contains(&n1) {
-                    cands[nc] = n1;
-                    nc += 1;
-                }
-                if nc < 2 {
+                {
                     // Second-nearest colour overall.
                     let mut best = (f32::MAX, n1);
                     for (k, c) in pal.lab.iter().enumerate().skip(1) {
@@ -152,6 +183,19 @@ pub fn unmix(an: &Analysis, pal: &Palette) -> MixMap {
                     let (t, res) = project_rgb(pal.rgb[ca as usize], pal.rgb[cb as usize], prgb);
                     if res < best.0 - 1e-3 {
                         best = (res, ca, cb, t);
+                    }
+                }
+            }
+            // Explained by nothing: a conflation pixel, where the canvas
+            // shows through the seam between two abutting shapes.
+            if let Some(canvas) = canvas.filter(|_| best.0 >= RGB_MIX_TOL) {
+                for ia in 0..nc {
+                    for ib in ia + 1..nc {
+                        let (ca, cb) = (cands[ia], cands[ib]);
+                        let (w, res) = project_tri_rgb(pal.rgb[ca as usize], pal.rgb[cb as usize], canvas, prgb);
+                        if res < RGB_MIX_TOL && res < best.0 - 1e-3 && w[2] > 0.02 {
+                            best = (res, ca, cb, conflation_t(w));
+                        }
                     }
                 }
             }
@@ -192,6 +236,40 @@ mod tests {
         assert!((cr - 0.5).abs() < 0.15 && (cb - 0.5).abs() < 0.15, "{m:?} red {cr} blue {cb}");
         assert_eq!(mm.mix[5 * 20 + 3], Mix::solid(red));
         assert_eq!(mm.coverage(-1, 5, 0), 1.0);
+    }
+
+    #[test]
+    fn conflation_seam_is_a_mix_of_its_neighbours() {
+        // Blue left, green right, abutting on a white canvas: the seam
+        // column is blue at half coverage over green at half coverage over
+        // white, as a renderer that anti-aliases each shape separately
+        // leaves it. Not a colour of its own, and a 50/50 boundary.
+        let (blue, green) = ([59u8, 130, 246], [34u8, 197, 94]);
+        let seam = [
+            (0.5 * 59.0 + 0.25 * 34.0 + 0.25 * 255.0) as u8,
+            (0.5 * 130.0 + 0.25 * 197.0 + 0.25 * 255.0) as u8,
+            (0.5 * 246.0 + 0.25 * 94.0 + 0.25 * 255.0) as u8,
+        ];
+        // On a white page (a 2 px frame), so the canvas is the background.
+        let mut img = Raster::filled(25, 16, [255, 255, 255, 255]);
+        for y in 2..14 {
+            for x in 2..12 {
+                img.set(x, y, [blue[0], blue[1], blue[2], 255]);
+            }
+            img.set(12, y, [seam[0], seam[1], seam[2], 255]);
+            for x in 13..23 {
+                img.set(x, y, [green[0], green[1], green[2], 255]);
+            }
+        }
+        let an = analyse(&img, 0.03);
+        let pal = estimate(&img, &an, &PaletteOpts::default());
+        assert_eq!(pal.len(), 4, "{:?}", pal.rgb);
+        let mm = unmix(&an, &pal);
+        let b = pal.nearest(an.lab[7 * 25 + 5]);
+        let g = pal.nearest(an.lab[7 * 25 + 18]);
+        let m = mm.mix[7 * 25 + 12];
+        let (cb, cg) = (m.coverage(b), m.coverage(g));
+        assert!((cb - 0.5).abs() < 0.1 && (cg - 0.5).abs() < 0.1, "{m:?} blue {cb} green {cg}");
     }
 
     #[test]

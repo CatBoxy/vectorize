@@ -46,8 +46,13 @@ the palette; `ignore_background` drops the border-majority colour. `curve_fit` i
 the dense sub-pixel contour between corners) or `potrace` (Selinger's smooth + opticurve on the polygon),
 kept for comparison.
 
-Debugging: `VECTORIZE_DEBUG=1` prints a summary per stage; `=elbows`, `=chains`, `=edges`, `=stack` and
-`=trace` print the contour points, boundary chains, per-edge fit counts, stacking order and fitter calls;
+`corners` (0..1) is the Corners slider: 0 only keeps sharp corners, 1 keeps every turn (M3 corner model:
+Potrace alpha, or a turn that no single line, arc or cubic can follow within `fit_accuracy`). `snap_lines`
+turns straight runs into `L` commands; circular runs become `A` arcs regardless (a circle is three arcs).
+
+Debugging: `VECTORIZE_DEBUG=1` prints a summary per stage; `=elbows`, `=chains`, `=edges`, `=stack`,
+`=junctions`, `=corners`, `=closed` and `=trace` print the contour points, boundary chains, per-edge fit
+counts, stacking order, junction refinement, corner decisions, closed-loop fits and fitter calls;
 `VECTORIZE_PROBE=x,y` prints the colour mix of the pixels around a point.
 
 ## Windows notes

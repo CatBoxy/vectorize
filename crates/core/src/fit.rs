@@ -14,14 +14,37 @@
 //! bias Potrace's `smooth` has, about a third of a pixel on a circle).
 
 use crate::contour::Contour;
-use kurbo::{fit_to_cubic, BezPath, CubicBez, CurveFitSample, ParamCurveFit, ParamCurveNearest, PathEl, Point, Vec2};
+use crate::scene::{El, Path};
+use kurbo::{fit_to_cubic, CubicBez, CurveFitSample, ParamCurveFit, ParamCurveNearest, Point, Vec2};
 use std::ops::Range;
+
+/// One fitted primitive over a range of samples, ending at the range's
+/// last sample. Lines are preferred over arcs and arcs over cubics: the
+/// simpler the primitive, the more the output looks drawn, not traced.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Prim {
+    Line(Point),
+    Arc { r: f64, large: bool, sweep: bool, end: Point },
+    Cubic(CubicBez),
+}
+
+impl Prim {
+    fn el(&self) -> El {
+        match *self {
+            Prim::Line(p) => El::LineTo(p),
+            Prim::Arc { r, large, sweep, end } => El::ArcTo { r, large, sweep, end },
+            Prim::Cubic(c) => El::CurveTo(c.p1, c.p2, c.p3),
+        }
+    }
+}
 
 /// Turning angle, in degrees over one tangent window, above which a point
 /// inside a run is treated as a corner.
 pub const CUSP_DEG: f64 = 60.0;
 /// Samples closer than this to a corner vertex are not fitted, px.
 pub const CORNER_CLEAR: f64 = 1.5;
+/// Longest sweep of one arc, degrees.
+pub const MAX_ARC_DEG: f64 = 170.0;
 /// End tangents within this angle of the chord, on opposite sides of it,
 /// make a range too degenerate for the cubic fitter (radians, ~3°).
 pub const DEGENERATE_RAD: f64 = 0.052;
@@ -288,7 +311,7 @@ fn chord_deviation(samples: &[Point]) -> Option<f64> {
 /// return arms hundreds of pixels long on nearly straight data. Every
 /// control point must stay inside the samples' bounding box grown by half
 /// its diagonal plus a few times the accuracy.
-fn fit_is_sane(els: &[PathEl], samples: &[Point], accuracy: f64) -> bool {
+fn fit_is_sane(els: &[El], samples: &[Point], accuracy: f64) -> bool {
     if els.is_empty() {
         return false;
     }
@@ -299,18 +322,115 @@ fn fit_is_sane(els: &[PathEl], samples: &[Point], accuracy: f64) -> bool {
     let m = 0.5 * (bb.width().hypot(bb.height())) + 4.0 * accuracy + 1.0;
     let bb = bb.inflate(m, m);
     els.iter().all(|e| match *e {
-        PathEl::CurveTo(a, b, p) => bb.contains(a) && bb.contains(b) && bb.contains(p),
-        PathEl::QuadTo(a, p) => bb.contains(a) && bb.contains(p),
-        PathEl::LineTo(p) => bb.contains(p),
+        El::CurveTo(a, b, p) => bb.contains(a) && bb.contains(b) && bb.contains(p),
+        El::LineTo(p) | El::ArcTo { end: p, .. } => bb.contains(p),
         _ => true,
     })
 }
 
+/// Least-squares circle through `pts` (Kåsa's algebraic fit): centre and
+/// radius, or `None` when the points are collinear or too few.
+pub fn fit_circle(pts: &[Point]) -> Option<(Point, f64)> {
+    if pts.len() < 3 {
+        return None;
+    }
+    // Centre the data for conditioning.
+    let n = pts.len() as f64;
+    let mx = pts.iter().map(|p| p.x).sum::<f64>() / n;
+    let my = pts.iter().map(|p| p.y).sum::<f64>() / n;
+    let (mut suu, mut suv, mut svv, mut suuu, mut svvv, mut suvv, mut svuu) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    for p in pts {
+        let (u, v) = (p.x - mx, p.y - my);
+        suu += u * u;
+        suv += u * v;
+        svv += v * v;
+        suuu += u * u * u;
+        svvv += v * v * v;
+        suvv += u * v * v;
+        svuu += v * u * u;
+    }
+    let det = suu * svv - suv * suv;
+    if det.abs() < 1e-9 {
+        return None;
+    }
+    let b1 = 0.5 * (suuu + suvv);
+    let b2 = 0.5 * (svvv + svuu);
+    let uc = (b1 * svv - b2 * suv) / det;
+    let vc = (b2 * suu - b1 * suv) / det;
+    let r = (uc * uc + vc * vc + (suu + svv) / n).sqrt();
+    if !r.is_finite() {
+        return None;
+    }
+    Some((Point::new(uc + mx, vc + my), r))
+}
+
+/// A circular arc through samples `a..=e` of `src`, pinned at both ends,
+/// if every sample is within `accuracy` of it and the samples sweep
+/// monotonically around its centre.
+fn try_arc(src: &PolySource, a: usize, e: usize, accuracy: f64) -> Option<Prim> {
+    let pts = &src.pts[a..=e];
+    if pts.len() < 4 {
+        return None;
+    }
+    let (p, q) = (pts[0], pts[pts.len() - 1]);
+    let chord = q - p;
+    let len = chord.hypot();
+    if len < 4.0 * accuracy {
+        return None;
+    }
+    let (c0, _) = fit_circle(pts)?;
+    // Keep the ends exactly on the arc: slide the centre onto the chord's
+    // perpendicular bisector.
+    let mid = p.midpoint(q);
+    let nrm = Vec2::new(-chord.y, chord.x) / len;
+    let c = mid + nrm * (c0 - mid).dot(nrm);
+    let r = (p - c).hypot();
+    if !(r.is_finite() && r > 2.0 * accuracy && r < 1.0e5) {
+        return None;
+    }
+    let mut prev = pts[0] - c;
+    let mut sign = 0.0f64;
+    let mut sweep_angle = 0.0;
+    for w in pts.windows(2) {
+        let v = w[1] - c;
+        let cr = prev.cross(v);
+        if cr != 0.0 {
+            if sign == 0.0 {
+                sign = cr.signum();
+            } else if cr.signum() != sign {
+                return None; // doubles back
+            }
+        }
+        sweep_angle += cr.atan2(prev.dot(v)).abs();
+        prev = v;
+    }
+    // An SVG arc is defined by its ends and radius; near 180° the centre is
+    // ill-conditioned (a chord shortened by 0.01 px by coordinate rounding
+    // makes a 100 px half circle sag by a pixel), so long sweeps are split.
+    if sweep_angle > MAX_ARC_DEG.to_radians() {
+        return None;
+    }
+    let stride = (pts.len() / 64).max(1);
+    for s in pts.iter().step_by(stride).chain(std::iter::once(&q)) {
+        if ((*s - c).hypot() - r).abs() > accuracy {
+            return None;
+        }
+    }
+    // SVG flags: sweep = clockwise on screen (positive cross in y-down
+    // coordinates); large = the arc's midpoint and the centre on the same
+    // side of the chord.
+    let s_mid = pts[pts.len() / 2];
+    let sweep = (s_mid - p).cross(q - s_mid) > 0.0;
+    let side = |x: Point| chord.cross(x - p).signum();
+    let large = side(s_mid) == side(c) && sweep_angle > std::f64::consts::PI;
+    Some(Prim::Arc { r, large, sweep, end: q })
+}
+
 /// Last resort: Douglas-Peucker polyline simplification at `tol`, as lines.
-fn simplify_lines(samples: &[Point], tol: f64, out: &mut Vec<PathEl>) {
-    fn rec(s: &[Point], tol: f64, out: &mut Vec<PathEl>) {
+fn simplify_lines(samples: &[Point], tol: f64, out: &mut Vec<El>) {
+    fn rec(s: &[Point], tol: f64, out: &mut Vec<El>) {
         if s.len() < 3 {
-            out.push(PathEl::LineTo(*s.last().unwrap()));
+            out.push(El::LineTo(*s.last().unwrap()));
             return;
         }
         let (a, b) = (s[0], *s.last().unwrap());
@@ -326,7 +446,7 @@ fn simplify_lines(samples: &[Point], tol: f64, out: &mut Vec<PathEl>) {
             }
         }
         if worst <= tol || at == 0 {
-            out.push(PathEl::LineTo(b));
+            out.push(El::LineTo(b));
         } else {
             rec(&s[..=at], tol, out);
             rec(&s[at..], tol, out);
@@ -339,6 +459,26 @@ fn simplify_lines(samples: &[Point], tol: f64, out: &mut Vec<PathEl>) {
 /// `accuracy` and it really stays within `1.25 × accuracy` of the samples
 /// (kurbo checks only 20 points, which is too few for a long range) with
 /// control points that do not fly off.
+/// The simplest primitive that fits samples `a..=e`: a line when every
+/// sample is within `accuracy` of the chord, else an arc, else a cubic.
+fn try_prim(src: &PolySource, a: usize, e: usize, accuracy: f64, snap_lines: bool) -> Option<Prim> {
+    let pts = &src.pts[a..=e];
+    if let Some(dev) = chord_deviation(pts) {
+        if dev <= accuracy {
+            let (p0, p3) = (pts[0], pts[pts.len() - 1]);
+            return Some(if snap_lines {
+                Prim::Line(p3)
+            } else {
+                Prim::Cubic(CubicBez::new(p0, p0.lerp(p3, 1.0 / 3.0), p0.lerp(p3, 2.0 / 3.0), p3))
+            });
+        }
+    }
+    if let Some(arc) = try_arc(src, a, e, accuracy) {
+        return Some(arc);
+    }
+    try_fit(src, a, e, accuracy).map(Prim::Cubic)
+}
+
 fn try_fit(src: &PolySource, a: usize, e: usize, accuracy: f64) -> Option<CubicBez> {
     let pts = &src.pts[a..=e];
     // Straight enough for a line: kurbo's moment matching is ill-conditioned
@@ -390,7 +530,7 @@ fn try_fit(src: &PolySource, a: usize, e: usize, accuracy: f64) -> Option<CubicB
         }
         return None;
     };
-    if !fit_is_sane(&[PathEl::CurveTo(c.p1, c.p2, c.p3)], pts, accuracy) {
+    if !fit_is_sane(&[El::CurveTo(c.p1, c.p2, c.p3)], pts, accuracy) {
         if dbg {
             eprintln!("try_fit {a}..{e}: insane {c:?}");
         }
@@ -413,21 +553,22 @@ fn try_fit(src: &PolySource, a: usize, e: usize, accuracy: f64) -> Option<CubicB
     Some(c)
 }
 
-/// Greedy segmentation of samples `lo..=hi`: each cubic is extended as far
-/// as a single fit stays within accuracy, found by exponential then binary
-/// search over sample indices. A few segments more than optimal in the
-/// worst case, and never slow or stuck, which kurbo's own optimiser can be.
-fn fit_greedy(src: &PolySource, lo: usize, hi: usize, accuracy: f64, out: &mut Vec<PathEl>) -> Vec<usize> {
+/// Greedy segmentation of samples `lo..=hi`: each primitive is extended as
+/// far as a single fit stays within accuracy, found by exponential then
+/// binary search over sample indices. A few segments more than optimal in
+/// the worst case, and never slow or stuck, which kurbo's own optimiser
+/// can be.
+fn fit_greedy(src: &PolySource, lo: usize, hi: usize, accuracy: f64, snap_lines: bool, out: &mut Vec<El>) -> Vec<usize> {
     let mut ends = Vec::new();
     let mut a = lo;
     while a < hi {
         let mut ok = a + 1;
-        let mut best: Option<CubicBez> = None;
+        let mut best: Option<Prim> = None;
         let mut fail: Option<usize> = None;
         let mut step = 1;
         loop {
             let e = (ok + step).min(hi);
-            match try_fit(src, a, e, accuracy) {
+            match try_prim(src, a, e, accuracy, snap_lines) {
                 Some(c) => {
                     ok = e;
                     best = Some(c);
@@ -445,7 +586,7 @@ fn fit_greedy(src: &PolySource, lo: usize, hi: usize, accuracy: f64, out: &mut V
         if let Some(mut f) = fail {
             while f - ok > 1 {
                 let m = (ok + f) / 2;
-                match try_fit(src, a, m, accuracy) {
+                match try_prim(src, a, m, accuracy, snap_lines) {
                     Some(c) => {
                         ok = m;
                         best = Some(c);
@@ -455,8 +596,8 @@ fn fit_greedy(src: &PolySource, lo: usize, hi: usize, accuracy: f64, out: &mut V
             }
         }
         match best {
-            Some(c) => out.push(PathEl::CurveTo(c.p1, c.p2, c.p3)),
-            None => out.push(PathEl::LineTo(src.pts[ok])),
+            Some(c) => out.push(c.el()),
+            None => out.push(El::LineTo(src.pts[ok])),
         }
         ends.push(ok);
         a = ok;
@@ -464,28 +605,27 @@ fn fit_greedy(src: &PolySource, lo: usize, hi: usize, accuracy: f64, out: &mut V
     ends
 }
 
-/// Elements (no `MoveTo`) approximating an open run with no corners inside.
-fn fit_open(samples: &[Point], o: &FitOpts) -> Vec<PathEl> {
-    if samples.len() < 2 {
+/// Elements (no `MoveTo`) approximating samples `a..=b` of `src`, an open
+/// run with no corners inside. Points of `src` outside the range are ghosts
+/// that only inform the tangents at the ends.
+fn fit_open_range(src: &PolySource, a: usize, b: usize, o: &FitOpts) -> Vec<El> {
+    if b <= a {
         return Vec::new();
     }
-    let last = *samples.last().unwrap();
+    let samples = &src.pts[a..=b];
+    let last = samples[samples.len() - 1];
     if samples.len() == 2 {
-        return vec![PathEl::LineTo(last)];
+        return vec![El::LineTo(last)];
     }
     if o.snap_lines {
         if let Some(dev) = chord_deviation(samples) {
             if dev <= o.accuracy {
-                return vec![PathEl::LineTo(last)];
+                return vec![El::LineTo(last)];
             }
         }
     }
-    let src = PolySource::new(samples, false, o.window);
-    if src.len() < 3 {
-        return vec![PathEl::LineTo(last)];
-    }
     let mut els = Vec::new();
-    fit_greedy(&src, 0, src.len() - 1, o.accuracy, &mut els);
+    fit_greedy(src, a, b, o.accuracy, o.snap_lines, &mut els);
     if fit_is_sane(&els, samples, o.accuracy) {
         return els;
     }
@@ -494,16 +634,168 @@ fn fit_open(samples: &[Point], o: &FitOpts) -> Vec<PathEl> {
     out
 }
 
+/// Elements (no `MoveTo`) approximating an open run with no corners inside.
+fn fit_open(samples: &[Point], o: &FitOpts) -> Vec<El> {
+    if samples.len() < 2 {
+        return Vec::new();
+    }
+    let src = PolySource::new(samples, false, o.window);
+    if src.len() < 2 {
+        return Vec::new();
+    }
+    fit_open_range(&src, 0, src.len() - 1, o)
+}
+
+/// Fit an open run whose ends continue smoothly into other curves: `prefix`
+/// leads into the first sample and `suffix` continues after the last (both
+/// ordered along the run). They only shape the end tangents, so the join is
+/// G1 across a junction instead of a kink.
+pub fn fit_run_ghost(samples: &[Point], prefix: &[Point], suffix: &[Point], o: &FitOpts) -> Vec<El> {
+    if samples.len() < 2 {
+        return Vec::new();
+    }
+    let mut all: Vec<Point> = Vec::with_capacity(prefix.len() + samples.len() + suffix.len());
+    all.extend_from_slice(prefix);
+    all.extend_from_slice(samples);
+    all.extend_from_slice(suffix);
+    let src = PolySource::new(&all, false, o.window);
+    // Dedup inside `PolySource::new` may have shifted indices; find the
+    // run's first and last sample by position.
+    let pts = src.points();
+    let find = |p: Point| (0..pts.len()).find(|&i| (pts[i] - p).hypot() < 1e-9);
+    let (Some(lo), Some(hi)) = (find(samples[0]), find(samples[samples.len() - 1])) else {
+        return fit_open(samples, o);
+    };
+    let hi = hi.max(lo);
+    let cusps: Vec<usize> = src.cusps().iter().copied().filter(|&c| c > lo && c < hi).collect();
+    let mut bounds = vec![lo];
+    bounds.extend(cusps);
+    bounds.push(hi);
+    let mut els = Vec::new();
+    for w in bounds.windows(2) {
+        els.extend(fit_open_range(&src, w[0], w[1], o));
+    }
+    els
+}
+
+/// Options for deciding which polygon vertices are corners.
+#[derive(Clone, Copy, Debug)]
+pub struct CornerOpts {
+    /// Potrace alpha threshold.
+    pub alphamax: f64,
+    /// Below this turning angle (radians) a vertex is never a corner.
+    pub min_turn: f64,
+    pub accuracy: f64,
+    pub window: f64,
+}
+
+/// Which polygon vertices are corners (PLAN.md M3): Potrace's alpha test,
+/// or, when the polygon turns by at least `min_turn` there, the accuracy
+/// test: a vertex is a corner if no single cubic fits the contour from the
+/// previous vertex to the next within `accuracy`. That second test does not
+/// depend on the polygon's edge lengths, which is where alpha alone fails
+/// (corners next to short edges, ends of thin lines). For an open chain
+/// both ends are corners.
+pub fn classify_corners(pts: &[Point], fit_ok: &[bool], verts: &[Point], po: &[usize], closed: bool, o: &CornerOpts) -> Vec<bool> {
+    let m = verts.len();
+    let n = pts.len();
+    (0..m)
+        .map(|i| {
+            if !closed && (i == 0 || i == m - 1) {
+                return true;
+            }
+            if m < 3 {
+                return true;
+            }
+            let (ip, inx) = ((i + m - 1) % m, (i + 1) % m);
+            let (p, v, q) = (verts[ip], verts[i], verts[inx]);
+            if crate::curve::is_corner(p, v, q, o.alphamax) {
+                return true;
+            }
+            let (a, b) = (v - p, q - v);
+            let turn = a.cross(b).atan2(a.dot(b)).abs();
+            if turn < o.min_turn {
+                return false;
+            }
+            let span = if closed { (po[inx] + n - po[ip]) % n } else { po[inx].saturating_sub(po[ip]) };
+            if span == 0 {
+                return false;
+            }
+            let mut samples = Vec::with_capacity(span + 1);
+            samples.push(p);
+            let mut k = (po[ip] + 1) % n;
+            for _ in 1..span {
+                if fit_ok[k] {
+                    samples.push(pts[k]);
+                }
+                k = (k + 1) % n;
+            }
+            samples.push(q);
+            let smooth = smooth_across(&samples, o);
+            if std::env::var("VECTORIZE_DEBUG").as_deref() == Ok("corners") {
+                let src = PolySource::new(&samples, false, o.window);
+                let prim = if src.len() >= 3 { try_prim(&src, 0, src.len() - 1, o.accuracy, true) } else { None };
+                eprintln!(
+                    "corner? v{i} ({:.2},{:.2}) turn {:.1}° {} samples -> smooth {smooth} via {:?}",
+                    v.x,
+                    v.y,
+                    turn.to_degrees(),
+                    samples.len(),
+                    prim.map(|p| p.el())
+                );
+            }
+            !smooth
+        })
+        .collect()
+}
+
+/// Can one primitive (line, arc or cubic) follow `samples` end to end
+/// within `accuracy`?
+fn smooth_across(samples: &[Point], o: &CornerOpts) -> bool {
+    if samples.len() < 3 {
+        return true;
+    }
+    let src = PolySource::new(samples, false, o.window);
+    if src.len() < 3 {
+        return true;
+    }
+    try_prim(&src, 0, src.len() - 1, o.accuracy, true).is_some()
+}
+
 /// Start point and elements (no `MoveTo`) approximating a closed run with
-/// no corners. The greedy pass pays for its seam with up to two extra
-/// segments, so a second pass starts in the middle of the longest segment
-/// of the first, where the curve is easy, and the shorter result wins.
-fn fit_closed(samples: &[Point], o: &FitOpts) -> (Point, Vec<PathEl>) {
+/// no corners. How far each greedy cubic reaches depends on the noise it
+/// happens to meet, so the seam costs anything from zero to three extra
+/// segments depending on where the pass starts. Several starts are tried,
+/// evenly spaced plus the middle of the first pass's longest segment, and
+/// the shortest result wins.
+fn fit_closed(samples: &[Point], o: &FitOpts) -> (Point, Vec<El>) {
     let src = PolySource::new(samples, true, o.window);
     let n = src.len() - 1; // without the closing duplicate
+    // A whole circle: three arcs of 120° (two half circles would be
+    // numerically fragile, see `try_arc`).
+    if let Some((c, r)) = fit_circle(&src.pts[..n]) {
+        if r > 2.0 * o.accuracy && src.pts[..n].iter().all(|p| ((*p - c).hypot() - r).abs() <= o.accuracy) {
+            let v = src.pts[0] - c;
+            let a0 = v.atan2();
+            let sweep = crate::contour::signed_area2(&src.pts[..n]) > 0.0;
+            let dir = if sweep { 1.0 } else { -1.0 };
+            let at = |k: f64| {
+                let a = a0 + dir * k * (2.0 * std::f64::consts::PI / 3.0);
+                c + Vec2::new(a.cos(), a.sin()) * r
+            };
+            let start = at(0.0);
+            let els = vec![
+                El::ArcTo { r, large: false, sweep, end: at(1.0) },
+                El::ArcTo { r, large: false, sweep, end: at(2.0) },
+                El::ArcTo { r, large: false, sweep, end: start },
+            ];
+            return (start, els);
+        }
+    }
     let mut els = Vec::new();
-    let ends = fit_greedy(&src, 0, n, o.accuracy, &mut els);
+    let ends = fit_greedy(&src, 0, n, o.accuracy, o.snap_lines, &mut els);
     let mut best = (src.pts[0], els);
+    let mut starts: Vec<usize> = vec![n / 4, n / 2, 3 * n / 4];
     if ends.len() >= 2 {
         let mut a = 0;
         let (mut la, mut lb) = (0usize, 0usize);
@@ -514,12 +806,24 @@ fn fit_closed(samples: &[Point], o: &FitOpts) -> (Point, Vec<PathEl>) {
             }
             a = b;
         }
-        let mid = (la + lb) / 2;
+        starts.push((la + lb) / 2);
+    }
+    let dbg = std::env::var("VECTORIZE_DEBUG").as_deref() == Ok("closed");
+    if dbg {
+        eprintln!("closed run: {} samples, start 0: {} segments ends {:?}", n, ends.len(), ends);
+    }
+    for start in starts {
+        if start == 0 || start >= n {
+            continue;
+        }
         let mut rotated: Vec<Point> = src.pts[..n].to_vec();
-        rotated.rotate_left(mid);
+        rotated.rotate_left(start);
         let src2 = PolySource::new(&rotated, true, o.window);
         let mut els2 = Vec::new();
-        fit_greedy(&src2, 0, src2.len() - 1, o.accuracy, &mut els2);
+        let ends2 = fit_greedy(&src2, 0, src2.len() - 1, o.accuracy, o.snap_lines, &mut els2);
+        if dbg {
+            eprintln!("  start {start}: {} segments ends {:?}", ends2.len(), ends2);
+        }
         if els2.len() < best.1.len() {
             best = (src2.pts[0], els2);
         }
@@ -535,7 +839,7 @@ fn fit_closed(samples: &[Point], o: &FitOpts) -> (Point, Vec<PathEl>) {
 /// Path elements (no `MoveTo`) for `samples`, split at cusps. For a closed
 /// run the elements start at the returned point (a cusp if there is one,
 /// else `samples[0]`) and come back to it.
-pub fn fit_run(samples: &[Point], closed: bool, o: &FitOpts) -> (Point, Vec<PathEl>) {
+pub fn fit_run(samples: &[Point], closed: bool, o: &FitOpts) -> (Point, Vec<El>) {
     if samples.is_empty() {
         return (Point::ZERO, Vec::new());
     }
@@ -577,31 +881,16 @@ pub fn fit_run(samples: &[Point], closed: bool, o: &FitOpts) -> (Point, Vec<Path
 
 /// Append one closed subpath: the loop `c`, polygonised into `verts` at
 /// contour indices `po`, with `corner[i]` marking sharp vertices.
-pub fn append_loop(path: &mut BezPath, c: &Contour, verts: &[Point], po: &[usize], corner: &[bool], o: &FitOpts) {
+pub fn append_loop(path: &mut Path, c: &Contour, verts: &[Point], po: &[usize], corner: &[bool], o: &FitOpts) {
     let n = c.pts.len();
     let m = verts.len();
     if n == 0 || m == 0 {
         return;
     }
-    // Two polygon vertices can land on the same anti-aliased corner, a pixel
-    // apart and both sharp; keep the first, or the run between them becomes
-    // a hook.
-    let mut corners: Vec<usize> = Vec::new();
-    for i in (0..m).filter(|&i| corner[i]) {
-        if let Some(&prev) = corners.last() {
-            if (verts[i] - verts[prev]).hypot() <= CORNER_CLEAR {
-                continue;
-            }
-        }
-        corners.push(i);
-    }
-    if corners.len() >= 2 {
-        let (f, l) = (corners[0], *corners.last().unwrap());
-        if f != l && (verts[f] - verts[l]).hypot() <= CORNER_CLEAR {
-            corners.pop();
-        }
-    }
-    let mut els_all: Vec<PathEl> = Vec::new();
+    // Cut-corner vertex pairs were merged by the polygon stage; what is
+    // left a pixel apart is a real short edge, such as the end of a line.
+    let corners: Vec<usize> = (0..m).filter(|&i| corner[i]).collect();
+    let mut els_all: Vec<El> = Vec::new();
     let start;
     if corners.is_empty() {
         // One closed run over every usable point, starting at vertex 0.
@@ -648,7 +937,7 @@ pub fn append_loop(path: &mut BezPath, c: &Contour, verts: &[Point], po: &[usize
         return;
     }
     // The closing line is implied by `Z`.
-    if let Some(PathEl::LineTo(p)) = els_all.last() {
+    if let Some(El::LineTo(p)) = els_all.last() {
         if (*p - start).hypot() < 1e-9 {
             els_all.pop();
         }
@@ -700,13 +989,13 @@ mod tests {
         let pts: Vec<Point> = (0..20).map(|i| Point::new(i as f64, 0.01 * (i % 2) as f64)).collect();
         let o = FitOpts { accuracy: 0.3, snap_lines: true, window: 1.0 };
         let (_, els) = fit_run(&pts, false, &o);
-        assert_eq!(els, vec![PathEl::LineTo(Point::new(19.0, 0.01))]);
+        assert_eq!(els, vec![El::LineTo(Point::new(19.0, 0.01))]);
         // Without snapping it is still one segment, a straight cubic.
         let o = FitOpts { snap_lines: false, ..o };
         let (_, els) = fit_run(&pts, false, &o);
         assert_eq!(els.len(), 1, "{els:?}");
         match els[0] {
-            PathEl::CurveTo(a, b, p) => {
+            El::CurveTo(a, b, p) => {
                 assert!(a.y.abs() < 0.02 && b.y.abs() < 0.02 && (p.x - 19.0).abs() < 1e-9, "{els:?}");
             }
             _ => panic!("{els:?}"),
@@ -724,14 +1013,60 @@ mod tests {
             .collect();
         let o = FitOpts { accuracy: 0.1, snap_lines: true, window: 1.0 };
         let (start, els) = fit_run(&pts, true, &o);
-        assert_eq!(start, pts[0]);
-        assert!(els.len() <= 6, "{} segments", els.len());
+        assert!((start - pts[0]).hypot() < 0.05);
+        // A circle is three arcs.
+        assert_eq!(els.len(), 3, "{els:?}");
         for e in &els {
-            if let PathEl::CurveTo(_, _, p) = e {
-                let d = (*p - Point::new(50.0, 50.0)).hypot();
-                assert!((d - 40.0).abs() < 0.05, "end point off circle by {}", d - 40.0);
+            match e {
+                El::ArcTo { r, end, .. } => {
+                    assert!((r - 40.0).abs() < 0.05, "radius {r}");
+                    let d = (*end - Point::new(50.0, 50.0)).hypot();
+                    assert!((d - 40.0).abs() < 0.05, "end point off circle by {}", d - 40.0);
+                }
+                other => panic!("{other:?}"),
             }
         }
+        // The arcs trace the circle: area and winding of the sampled loop.
+        let mut path = Path::new();
+        path.move_to(start);
+        for e in &els {
+            path.push(*e);
+        }
+        path.close_path();
+        let area = path.area();
+        let want = crate::contour::signed_area2(&pts) / 2.0;
+        assert!((area - want).abs() < 20.0, "area {area} vs {want}");
+    }
+
+    #[test]
+    fn arc_fits_a_quarter_circle_and_rejects_a_bend() {
+        let r = 30.0;
+        let pts: Vec<Point> = (0..=60)
+            .map(|i| {
+                let t = i as f64 / 60.0 * std::f64::consts::FRAC_PI_2;
+                Point::new(10.0 + r * t.cos(), 10.0 + r * t.sin())
+            })
+            .collect();
+        let src = PolySource::new(&pts, false, 1.0);
+        let arc = try_arc(&src, 0, src.len() - 1, 0.1).expect("arc");
+        match arc {
+            Prim::Arc { r: rr, large, end, .. } => {
+                assert!((rr - r).abs() < 0.05 && !large && (end - pts[60]).hypot() < 1e-9, "{arc:?}");
+            }
+            _ => panic!("{arc:?}"),
+        }
+        // Rendered through cubics, the arc passes through the middle sample.
+        let mut path = Path::new();
+        path.move_to(pts[0]);
+        path.push(arc.el());
+        let bez = path.to_bez();
+        let mid = pts[30];
+        let near = bez.segments().map(|s| kurbo::ParamCurveNearest::nearest(&s, mid, 0.01).distance_sq.sqrt()).fold(f64::MAX, f64::min);
+        assert!(near < 0.05, "arc misses the middle sample by {near}");
+        // An L is not an arc.
+        let l: Vec<Point> = (0..10).map(|i| Point::new(i as f64, 0.0)).chain((1..10).map(|i| Point::new(9.0, i as f64))).collect();
+        let src = PolySource::new(&l, false, 1.0);
+        assert!(try_arc(&src, 0, src.len() - 1, 0.3).is_none());
     }
 
     #[test]
@@ -768,6 +1103,6 @@ mod tests {
         let (start, els) = fit_run(&pts, true, &o);
         assert_eq!(start, Point::new(30.0, 0.0));
         assert_eq!(els.len(), 4, "{els:?}");
-        assert!(els.iter().all(|e| matches!(e, PathEl::LineTo(_))), "{els:?}");
+        assert!(els.iter().all(|e| matches!(e, El::LineTo(_))), "{els:?}");
     }
 }

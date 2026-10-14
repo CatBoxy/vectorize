@@ -3,8 +3,8 @@
 //! fitting → one filled path per image in the mean foreground colour.
 
 use crate::params::CurveFit;
+use crate::scene::Path;
 use crate::{contour, coverage, curve, decompose, fit, polygon, Fill, Params, Raster, Scene, Shape, StageClock};
-use kurbo::BezPath;
 
 /// Half-width of the box a polygon vertex may move in during adjustment, px.
 /// Potrace uses 0.5 around a pixel corner; here a vertex on an anti-aliased
@@ -33,6 +33,7 @@ pub fn trace_bw(img: &Raster, params: &Params, clock: &mut StageClock) -> Scene 
         snap_lines: params.snap_lines,
         window: TANGENT_WINDOW,
     };
+    let copts = corner_opts(params);
     let contours: Vec<contour::Contour> = paths.iter().map(|p| contour::subpixel(p, &cov)).collect();
     clock.lap("contour");
     // Polygonise the measured points and the real corners only; stair
@@ -49,10 +50,10 @@ pub fn trace_bw(img: &Raster, params: &Params, clock: &mut StageClock) -> Scene 
         .collect();
     clock.lap("polygon");
     let dbg = std::env::var("VECTORIZE_DEBUG").is_ok();
-    let mut bez = BezPath::new();
+    let mut bez = Path::new();
     for (c, (verts, po)) in contours.iter().zip(&polygons) {
         if dbg {
-            let corners = curve::corner_flags(verts, amax).iter().filter(|&&b| b).count();
+            let corners = fit::classify_corners(&c.pts, &c.fit_ok, verts, po, true, &copts).iter().filter(|&&b| b).count();
             eprintln!(
                 "loop: contour {} pts ({} elbows, {} fit_ok), polygon {} verts, {} corners, po {:?}",
                 c.pts.len(),
@@ -79,7 +80,7 @@ pub fn trace_bw(img: &Raster, params: &Params, clock: &mut StageClock) -> Scene 
                 curve::append_subpath(&mut bez, &segs);
             }
             CurveFit::Kurbo => {
-                let corner = curve::corner_flags(verts, amax);
+                let corner = fit::classify_corners(&c.pts, &c.fit_ok, verts, po, true, &copts);
                 fit::append_loop(&mut bez, c, verts, po, &corner, &fit_opts);
             }
         }
@@ -97,6 +98,19 @@ pub fn trace_bw(img: &Raster, params: &Params, clock: &mut StageClock) -> Scene 
 /// every bend one.
 pub fn alphamax(corners: f64) -> f64 {
     1.4 - 0.8 * corners.clamp(0.0, 1.0)
+}
+
+/// Corner decision options from the user parameters: alpha from the slider,
+/// and the smallest turn that is allowed to be a corner, 40° at slider 0
+/// down to 0° at slider 1 (20° at the default 0.5).
+pub fn corner_opts(params: &Params) -> fit::CornerOpts {
+    let c = params.corners.clamp(0.0, 1.0);
+    fit::CornerOpts {
+        alphamax: alphamax(c),
+        min_turn: (40.0 - 40.0 * c).to_radians(),
+        accuracy: params.fit_accuracy.clamp(0.02, 4.0),
+        window: TANGENT_WINDOW,
+    }
 }
 
 /// Mean colour of the interior foreground pixels (all four neighbours also

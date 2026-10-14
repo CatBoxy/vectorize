@@ -116,7 +116,8 @@ impl StageClock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kurbo::{ParamCurve, PathEl, Shape as _};
+    use crate::scene::El;
+    use kurbo::ParamCurve;
 
     /// The M1 pipeline, which these tests exercise.
     fn bw() -> Params {
@@ -180,7 +181,7 @@ mod tests {
         // Walk the path densely and measure radial error.
         let path = &out.scene.shapes[0].path;
         let mut worst: f64 = 0.0;
-        for seg in path.segments() {
+        for seg in path.to_bez().segments() {
             for i in 0..=50 {
                 let p = seg.eval(i as f64 / 50.0);
                 let d = ((p.x - cx).powi(2) + (p.y - cy).powi(2)).sqrt();
@@ -203,7 +204,7 @@ mod tests {
         }
         let out = trace(&img, &bw());
         let els = out.scene.shapes[0].path.elements();
-        let moves = els.iter().filter(|e| matches!(e, PathEl::MoveTo(_))).count();
+        let moves = els.iter().filter(|e| matches!(e, El::MoveTo(_))).count();
         assert_eq!(moves, 2, "{}", out.svg);
         // Signed area of the whole path: outer minus hole.
         let area = out.scene.shapes[0].path.area().abs();
@@ -256,13 +257,13 @@ mod tests {
             let out = trace(&img, &Params { min_area: 1, ..bw() });
             for s in &out.scene.shapes {
                 let els = s.path.elements();
-                assert!(matches!(els.last(), Some(PathEl::ClosePath)));
+                assert!(matches!(els.last(), Some(El::Close)));
                 for el in els {
                     for p in match *el {
-                        PathEl::MoveTo(p) | PathEl::LineTo(p) => vec![p],
-                        PathEl::QuadTo(a, p) => vec![a, p],
-                        PathEl::CurveTo(a, b, p) => vec![a, b, p],
-                        PathEl::ClosePath => vec![],
+                        El::MoveTo(p) | El::LineTo(p) => vec![p],
+                        El::CurveTo(a, b, p) => vec![a, b, p],
+                        El::ArcTo { end, .. } => vec![end],
+                        El::Close => vec![],
                     } {
                         assert!(p.x.is_finite() && p.y.is_finite());
                     }

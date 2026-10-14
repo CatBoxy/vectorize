@@ -1,8 +1,8 @@
 //! Minimal SVG writer. Coordinates are rounded to 0.01 px (Potrace uses 0.1;
 //! the finer grid costs ~1 byte per coordinate and keeps sub-pixel fits honest).
 
+use crate::scene::El;
 use crate::{Fill, Scene};
-use kurbo::PathEl;
 use std::fmt::Write;
 
 pub fn write(scene: &Scene) -> String {
@@ -21,7 +21,7 @@ pub fn write(scene: &Scene) -> String {
             let _ = write!(s, " fill-opacity=\"{}\"", fmt(c[3] as f64 / 255.0));
         }
         s.push_str(" d=\"");
-        push_path(&mut s, &shape.path);
+        push_path(&mut s, shape.path.elements());
         s.push_str("\"/>");
     }
     s.push_str("</svg>");
@@ -32,26 +32,31 @@ fn push_color(s: &mut String, c: [u8; 4]) {
     let _ = write!(s, "#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
 }
 
-fn push_path(s: &mut String, path: &kurbo::BezPath) {
-    for el in path.elements() {
+fn push_path(s: &mut String, els: &[El]) {
+    for el in els {
         match *el {
-            PathEl::MoveTo(p) => {
+            El::MoveTo(p) => {
                 let _ = write!(s, "M{} {}", fmt(p.x), fmt(p.y));
             }
-            PathEl::LineTo(p) => {
+            El::LineTo(p) => {
                 let _ = write!(s, "L{} {}", fmt(p.x), fmt(p.y));
             }
-            PathEl::QuadTo(a, p) => {
-                let _ = write!(s, "Q{} {} {} {}", fmt(a.x), fmt(a.y), fmt(p.x), fmt(p.y));
+            El::CurveTo(a, b, p) => {
+                let _ = write!(s, "C{} {} {} {} {} {}", fmt(a.x), fmt(a.y), fmt(b.x), fmt(b.y), fmt(p.x), fmt(p.y));
             }
-            PathEl::CurveTo(a, b, p) => {
+            El::ArcTo { r, large, sweep, end } => {
                 let _ = write!(
                     s,
-                    "C{} {} {} {} {} {}",
-                    fmt(a.x), fmt(a.y), fmt(b.x), fmt(b.y), fmt(p.x), fmt(p.y)
+                    "A{} {} 0 {} {} {} {}",
+                    fmt(r),
+                    fmt(r),
+                    large as u8,
+                    sweep as u8,
+                    fmt(end.x),
+                    fmt(end.y)
                 );
             }
-            PathEl::ClosePath => s.push('Z'),
+            El::Close => s.push('Z'),
         }
     }
 }

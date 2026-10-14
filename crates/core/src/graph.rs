@@ -10,13 +10,13 @@
 //! there are no seams.
 
 use crate::chain::{self, Chain};
-use crate::curve;
 use crate::decompose::DIRS;
 use crate::fit::{self, FitOpts, CORNER_CLEAR};
 use crate::mix::MixMap;
 use crate::polygon;
 use crate::regions::{Regions, OUTSIDE};
-use kurbo::{BezPath, PathEl, Point, Vec2};
+use crate::scene::{El, Path};
+use kurbo::{Point, Vec2};
 use std::collections::HashMap;
 
 const NONE: u32 = u32::MAX;
@@ -32,7 +32,7 @@ pub struct Edge {
     /// Fitted curve from `start` to `end` (a loop returns to `start`).
     pub start: Point,
     pub end: Point,
-    pub els: Vec<PathEl>,
+    pub els: Vec<El>,
 }
 
 pub struct Graph {
@@ -276,6 +276,23 @@ impl Graph {
             let y = (a * e - b * d) / det;
             let c0 = Point::new(corner.0 as f64, corner.1 as f64);
             let p = Point::new(x, y);
+            // The lines of a real junction all pass close to one point. At a
+            // tangency two of them are nearly parallel and offset, and the
+            // least-squares point sits between them, off every line; a
+            // chain pinned there bends into a hook. Keep the pixel corner.
+            let consistent = ls.iter().all(|(q, dir)| ((p - *q).cross(*dir)).abs() <= JUNCTION_FIT);
+            if std::env::var("VECTORIZE_DEBUG").as_deref() == Ok("junctions") {
+                let dists: Vec<String> = ls.iter().map(|(q, dir)| format!("{:.2}", ((p - *q).cross(*dir)).abs())).collect();
+                eprintln!(
+                    "junction {corner:?}: {} lines, ls ({:.2}, {:.2}), dists {dists:?}, consistent {consistent}",
+                    ls.len(),
+                    p.x,
+                    p.y
+                );
+            }
+            if !consistent {
+                continue;
+            }
             if (p - c0).hypot() <= JUNCTION_BOX {
                 self.junctions.insert(corner, p);
             } else {
@@ -286,9 +303,10 @@ impl Graph {
     }
 
     /// Refine, polygonise and fit every edge.
-    pub fn fit(&mut self, reg: &Regions, mm: &MixMap, tol: f64, vbox: f64, alphamax: f64, o: &FitOpts) {
+    pub fn fit(&mut self, reg: &Regions, mm: &MixMap, tol: f64, vbox: f64, copts: &fit::CornerOpts, o: &FitOpts) {
         let mut chains = self.refine_chains(reg, mm);
         self.refine_junctions(&chains);
+        let ghosts = self.pair_continuations(&chains);
         if std::env::var("VECTORIZE_DEBUG").as_deref() == Ok("chains") {
             for (i, (e, c)) in self.edges.iter().zip(&chains).enumerate() {
                 let pts: Vec<String> = c
@@ -309,7 +327,7 @@ impl Graph {
                 );
             }
         }
-        for (e, c) in self.edges.iter_mut().zip(chains.iter_mut()) {
+        for (ei, (e, c)) in self.edges.iter_mut().zip(chains.iter_mut()).enumerate() {
             if !e.closed {
                 if let Some(p) = self.junctions.get(&e.corners[0]) {
                     c.pts[0] = *p;
@@ -324,9 +342,9 @@ impl Graph {
             if e.closed {
                 let (verts, po) = polygon::polygonize(&pts, &dirs, tol, vbox);
                 let po: Vec<usize> = po.into_iter().map(|j| idx[j]).collect();
-                let mut path = BezPath::new();
+                let mut path = Path::new();
                 if verts.len() >= 3 {
-                    let corner = curve::corner_flags(&verts, alphamax);
+                    let corner = fit::classify_corners(&c.pts, &c.fit_ok, &verts, &po, true, copts);
                     let contour = crate::contour::Contour {
                         pts: c.pts.clone(),
                         dirs: c.dirs.clone(),
@@ -339,7 +357,7 @@ impl Graph {
                 let (start, mut els) = split_path(&path);
                 if let Some(s) = start {
                     if els.last().map_or(true, |l| (end_of(l) - s).hypot() > 1e-9) {
-                        els.push(PathEl::LineTo(s));
+                        els.push(El::LineTo(s));
                     }
                     e.start = s;
                     e.end = s;
@@ -356,12 +374,10 @@ impl Graph {
                 e.end = *c.pts.last().unwrap();
                 e.els.clear();
                 if m < 2 {
-                    e.els.push(PathEl::LineTo(e.end));
+                    e.els.push(El::LineTo(e.end));
                     continue;
                 }
-                let corner: Vec<bool> = (0..m)
-                    .map(|i| i == 0 || i == m - 1 || curve::is_corner(verts[i - 1], verts[i], verts[i + 1], alphamax))
-                    .collect();
+                let corner = fit::classify_corners(&c.pts, &c.fit_ok, &verts, &po, false, copts);
                 let cs: Vec<usize> = (0..m).filter(|&i| corner[i]).collect();
                 if std::env::var("VECTORIZE_DEBUG").as_deref() == Ok("chains") {
                     eprintln!(
@@ -383,10 +399,16 @@ impl Graph {
                         }
                     }
                     samples.push(vb);
-                    e.els.extend(fit::fit_run(&samples, false, o).1);
+                    let prefix: &[Point] = if a == 0 { ghosts.get(&(ei, true)).map(|v| v.as_slice()).unwrap_or(&[]) } else { &[] };
+                    let suffix: &[Point] = if b == m - 1 { ghosts.get(&(ei, false)).map(|v| v.as_slice()).unwrap_or(&[]) } else { &[] };
+                    if prefix.is_empty() && suffix.is_empty() {
+                        e.els.extend(fit::fit_run(&samples, false, o).1);
+                    } else {
+                        e.els.extend(fit::fit_run_ghost(&samples, prefix, suffix, o));
+                    }
                 }
                 if e.els.is_empty() {
-                    e.els.push(PathEl::LineTo(e.end));
+                    e.els.push(El::LineTo(e.end));
                 }
                 if std::env::var("VECTORIZE_DEBUG").as_deref() == Ok("edges") {
                     let runs: Vec<String> = cs
@@ -399,12 +421,72 @@ impl Graph {
                         m,
                         cs.len(),
                         e.els.len(),
-                        e.els.iter().filter(|x| matches!(x, PathEl::LineTo(_))).count(),
+                        e.els.iter().filter(|x| matches!(x, El::LineTo(_))).count(),
                         runs.join(",")
                     );
                 }
             }
         }
+    }
+
+    /// At every junction, pair the two chains that continue most nearly
+    /// straight through it (within [`CONTINUE_DEG`] of a straight line) and
+    /// hand each the other's first points as ghosts, so their end tangents
+    /// agree and the shared boundary stays G1 through the junction (the
+    /// Adobe 2025 recipe). Keyed by `(edge, at_start)`; a prefix is ordered
+    /// toward the junction, a suffix away from it.
+    fn pair_continuations(&self, chains: &[Chain]) -> HashMap<(usize, bool), Vec<Point>> {
+        let mut ends_at: HashMap<(i32, i32), Vec<(usize, bool, Vec2, Vec<Point>)>> = HashMap::new();
+        for (ei, (e, c)) in self.edges.iter().zip(chains).enumerate() {
+            if e.closed {
+                continue;
+            }
+            let n = c.pts.len();
+            for (corner, at_start) in [(e.corners[0], true), (*e.corners.last().unwrap(), false)] {
+                let j = if at_start { c.pts[0] } else { c.pts[n - 1] };
+                let near: Vec<Point> = if at_start {
+                    (1..n).filter(|&k| c.fit_ok[k] && !c.is_corner[k]).take(GHOSTS).map(|k| c.pts[k]).collect()
+                } else {
+                    (0..n - 1).rev().filter(|&k| c.fit_ok[k] && !c.is_corner[k]).take(GHOSTS).map(|k| c.pts[k]).collect()
+                };
+                if near.len() < 2 {
+                    continue;
+                }
+                let d = near[near.len() - 1] - j;
+                if d.hypot() < 1e-9 {
+                    continue;
+                }
+                ends_at.entry(corner).or_default().push((ei, at_start, d / d.hypot(), near));
+            }
+        }
+        let limit = -(CONTINUE_DEG.to_radians().cos());
+        let mut ghosts = HashMap::new();
+        for list in ends_at.values() {
+            let mut used = vec![false; list.len()];
+            loop {
+                let mut best: Option<(f64, usize, usize)> = None;
+                for i in 0..list.len() {
+                    for k in i + 1..list.len() {
+                        if used[i] || used[k] {
+                            continue;
+                        }
+                        // Outgoing directions; a straight continuation is opposite.
+                        let cos = list[i].2.dot(list[k].2);
+                        if cos < -limit && best.map_or(true, |(bc, _, _)| cos < bc) {
+                            best = Some((cos, i, k));
+                        }
+                    }
+                }
+                let Some((_, i, k)) = best else { break };
+                used[i] = true;
+                used[k] = true;
+                let gi: Vec<Point> = if list[i].1 { list[k].3.iter().rev().copied().collect() } else { list[k].3.clone() };
+                let gk: Vec<Point> = if list[k].1 { list[i].3.iter().rev().copied().collect() } else { list[i].3.clone() };
+                ghosts.insert((list[i].0, list[i].1), gi);
+                ghosts.insert((list[k].0, list[k].1), gk);
+            }
+        }
+        ghosts
     }
 
     /// The cycles of every region: lists of `(edge, forward)`.
@@ -518,14 +600,14 @@ impl Graph {
     }
 
     /// Path of one cycle from the fitted edges.
-    pub fn cycle_path(&self, cycle: &[(u32, bool)], path: &mut BezPath) {
+    pub fn cycle_path(&self, cycle: &[(u32, bool)], path: &mut Path) {
         if cycle.is_empty() {
             return;
         }
         let (e0, f0) = cycle[0];
         let e = &self.edges[e0 as usize];
         let start = if f0 { e.start } else { e.end };
-        let mut els: Vec<PathEl> = Vec::new();
+        let mut els: Vec<El> = Vec::new();
         for &(id, fwd) in cycle {
             let e = &self.edges[id as usize];
             if fwd {
@@ -535,7 +617,7 @@ impl Graph {
             }
         }
         // The closing line is implied by `Z`.
-        if let Some(PathEl::LineTo(p)) = els.last() {
+        if let Some(El::LineTo(p)) = els.last() {
             if (*p - start).hypot() < 1e-9 {
                 els.pop();
             }
@@ -550,6 +632,14 @@ impl Graph {
 
 /// Junction positions may move at most this far from their pixel corner.
 pub const JUNCTION_BOX: f64 = 1.0;
+/// A refined junction must lie within this distance of every incident
+/// chain's line, px.
+pub const JUNCTION_FIT: f64 = 0.25;
+/// Points borrowed from the continuing chain to shape an end tangent.
+pub const GHOSTS: usize = 5;
+/// Two chains continue through a junction when the angle between them is
+/// within this many degrees of a straight line.
+pub const CONTINUE_DEG: f64 = 20.0;
 
 /// Which side of a pixel edge a walk in direction `d` sees, given the chain
 /// direction `cd` on it: bit 1 for the chain's left side, bit 2 for its
@@ -581,21 +671,18 @@ fn fit_line(pts: &[Point]) -> Option<(Point, Vec2)> {
     Some((c, dir))
 }
 
-fn end_of(el: &PathEl) -> Point {
-    match *el {
-        PathEl::MoveTo(p) | PathEl::LineTo(p) | PathEl::QuadTo(_, p) | PathEl::CurveTo(_, _, p) => p,
-        PathEl::ClosePath => Point::ZERO,
-    }
+fn end_of(el: &El) -> Point {
+    el.end().unwrap_or(Point::ZERO)
 }
 
 /// Start point and the elements after `MoveTo`, without `ClosePath`.
-fn split_path(path: &BezPath) -> (Option<Point>, Vec<PathEl>) {
+fn split_path(path: &Path) -> (Option<Point>, Vec<El>) {
     let mut start = None;
     let mut els = Vec::new();
     for el in path.elements() {
         match el {
-            PathEl::MoveTo(p) => start = Some(*p),
-            PathEl::ClosePath => {}
+            El::MoveTo(p) => start = Some(*p),
+            El::Close => {}
             other => els.push(*other),
         }
     }
@@ -603,7 +690,7 @@ fn split_path(path: &BezPath) -> (Option<Point>, Vec<PathEl>) {
 }
 
 /// The same curve walked backwards: from the last end point back to `start`.
-pub fn reverse_els(start: Point, els: &[PathEl]) -> Vec<PathEl> {
+pub fn reverse_els(start: Point, els: &[El]) -> Vec<El> {
     let mut out = Vec::with_capacity(els.len());
     let mut from = Vec::with_capacity(els.len());
     let mut cur = start;
@@ -613,9 +700,9 @@ pub fn reverse_els(start: Point, els: &[PathEl]) -> Vec<PathEl> {
     }
     for (el, &q) in els.iter().zip(&from).rev() {
         out.push(match *el {
-            PathEl::CurveTo(a, b, _) => PathEl::CurveTo(b, a, q),
-            PathEl::QuadTo(a, _) => PathEl::QuadTo(a, q),
-            _ => PathEl::LineTo(q),
+            El::CurveTo(a, b, _) => El::CurveTo(b, a, q),
+            El::ArcTo { r, large, sweep, .. } => El::ArcTo { r, large, sweep: !sweep, end: q },
+            _ => El::LineTo(q),
         });
     }
     out
@@ -675,24 +762,24 @@ mod tests {
         let reg = label(&mut mm, Some(1), 1);
         let mut g = Graph::build(&reg);
         let o = FitOpts { accuracy: 0.3, snap_lines: true, window: 1.0 };
-        g.fit(&reg, &mm, 0.2, 1.5, 1.0, &o);
+        let copts = fit::CornerOpts { alphamax: 1.0, min_turn: 0.35, accuracy: 0.3, window: 1.0 };
+        g.fit(&reg, &mm, 0.2, 1.5, &copts, &o);
         let faces = g.faces(&reg);
         let b = reg.get(1, 1) as usize;
-        let mut path = BezPath::new();
+        let mut path = Path::new();
         g.cycle_path(&faces[b][0], &mut path);
         // A rectangle: four lines.
-        let lines = path.elements().iter().filter(|e| matches!(e, PathEl::LineTo(_))).count();
+        let lines = path.elements().iter().filter(|e| matches!(e, El::LineTo(_))).count();
         assert!(lines >= 3 && lines <= 4, "{:?}", path.elements());
         // Its end returns to its start.
         let els = path.elements();
         let start = match els[0] {
-            PathEl::MoveTo(p) => p,
+            El::MoveTo(p) => p,
             _ => panic!(),
         };
         let last = els[..els.len() - 1].last().unwrap();
         let p = end_of(last);
         assert!((p - start).hypot() < 1e-9 || lines == 3, "{:?}", els);
-        use kurbo::Shape;
         assert!((path.area().abs() - 9.0).abs() < 0.5, "area {}", path.area());
     }
 
@@ -700,12 +787,12 @@ mod tests {
     fn reverse_round_trips() {
         let start = Point::new(0.0, 0.0);
         let els = vec![
-            PathEl::CurveTo(Point::new(1.0, 1.0), Point::new(2.0, 1.0), Point::new(3.0, 0.0)),
-            PathEl::LineTo(Point::new(5.0, 0.0)),
+            El::CurveTo(Point::new(1.0, 1.0), Point::new(2.0, 1.0), Point::new(3.0, 0.0)),
+            El::LineTo(Point::new(5.0, 0.0)),
         ];
         let rev = reverse_els(start, &els);
-        assert_eq!(rev[0], PathEl::LineTo(Point::new(3.0, 0.0)));
-        assert_eq!(rev[1], PathEl::CurveTo(Point::new(2.0, 1.0), Point::new(1.0, 1.0), Point::new(0.0, 0.0)));
+        assert_eq!(rev[0], El::LineTo(Point::new(3.0, 0.0)));
+        assert_eq!(rev[1], El::CurveTo(Point::new(2.0, 1.0), Point::new(1.0, 1.0), Point::new(0.0, 0.0)));
         let back = reverse_els(Point::new(5.0, 0.0), &rev);
         assert_eq!(back, els);
     }
