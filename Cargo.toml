@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/cli", "crates/bench"]
+# crates/wasm joins once M5 starts; it needs the wasm32 target installed.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/juancruzlambrechts/vectorize"
+
+[workspace.dependencies]
+kurbo = "0.13"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+rayon = "1.10"
+resvg = "0.48"
+
+[profile.release]
+opt-level = 3
+debug = 1
+lto = "thin"
+
+[profile.bench-fast]
+inherits = "release"
+debug = 0

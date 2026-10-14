@@ -1,0 +1,13 @@
+[package]
+name = "vectorize-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Raster to SVG tracer core: pure, no I/O, no threads"
+
+[lib]
+name = "vectorize_core"
+
+[dependencies]
+kurbo.workspace = true
+serde.workspace = true

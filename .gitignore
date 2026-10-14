@@ -1,0 +1,11 @@
+.explain/
+/target
+/corpus/**/*.png
+/corpus/**/*.jpg
+/corpus/**/*.svg
+!/corpus/synthetic/**
+/bench/out/
+/bench/arena/
+web/node_modules/
+web/.next/
+web/.env*.local

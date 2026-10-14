@@ -1,0 +1,16 @@
+[package]
+name = "vectorize-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vectorize"
+path = "src/main.rs"
+
+[dependencies]
+vectorize-core = { path = "../core" }
+image.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
