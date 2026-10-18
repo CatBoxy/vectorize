@@ -68,11 +68,15 @@ mod tests {
         // short where three curves meet; a real gap is far below that.
         let (mut lo, mut hi, mut low_count) = (u32::MAX, 0u32, 0usize);
         let mut first = Vec::new();
+        let mut hi_at = (0, 0);
         for y in 1..size - 1 {
             for x in 1..size - 1 {
                 let s = sum[(y * size + x) as usize];
                 lo = lo.min(s);
-                hi = hi.max(s);
+                if s > hi {
+                    hi = s;
+                    hi_at = (x, y);
+                }
                 if s < 200 {
                     low_count += 1;
                     if first.len() < 8 {
@@ -83,6 +87,9 @@ mod tests {
         }
         if low_count > 0 {
             eprintln!("{size} {method:?}: first under-covered pixels (x, y, sum): {first:?}");
+        }
+        if hi > 262 {
+            eprintln!("{size} {method:?}: max coverage sum {hi} at {hi_at:?}");
         }
         (lo, hi, low_count)
     }

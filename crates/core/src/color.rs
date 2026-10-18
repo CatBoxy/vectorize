@@ -1,13 +1,13 @@
 //! Colour tracer (PLAN.md M2): palette → per-pixel mix → regions →
 //! boundary graph → one fitted curve per boundary → one path per colour.
 
-use crate::bw::{alphamax, TANGENT_WINDOW, VERTEX_BOX};
+use crate::bw::{corner_opts, TANGENT_WINDOW, VERTEX_BOX};
 use crate::fit::FitOpts;
 use crate::graph::Graph;
 use crate::palette::{self, PaletteOpts};
 use crate::params::{Method, Mode};
 use crate::{mix, regions, Fill, Params, Raster, Scene, Shape, StageClock};
-use kurbo::BezPath;
+use crate::scene::Path;
 use std::collections::BTreeMap;
 
 /// Clusters closer than this in OKLab are one colour.
@@ -63,15 +63,15 @@ pub fn trace_color(img: &Raster, params: &Params, clock: &mut StageClock) -> Sce
         snap_lines: params.snap_lines,
         window: TANGENT_WINDOW,
     };
-    g.fit(&reg, &mm, params.tolerance.clamp(0.05, 4.0), VERTEX_BOX, alphamax(params.corners), &o);
+    g.fit(&reg, &mm, params.tolerance.clamp(0.05, 4.0), VERTEX_BOX, &corner_opts(params), &o);
     clock.lap("fit");
     let faces = g.faces(&reg);
     let skip_bg = if params.ignore_background { pal.background } else { None };
-    let mut shapes: Vec<(u16, BezPath)> = Vec::new();
+    let mut shapes: Vec<(u16, Path)> = Vec::new();
     match params.method {
         Method::Abutting => {
             // Every region with all its cycles, one path per colour.
-            let mut by_color: BTreeMap<u16, BezPath> = BTreeMap::new();
+            let mut by_color: BTreeMap<u16, Path> = BTreeMap::new();
             for (r, cycles) in faces.iter().enumerate() {
                 let color = reg.color[r];
                 if color == 0 || Some(color) == skip_bg {
@@ -96,14 +96,14 @@ pub fn trace_color(img: &Raster, params: &Params, clock: &mut StageClock) -> Sce
             // across that outer boundary, the enclosing region: the parent.
             // An outline ring has fewer pixels than the face inside it, so
             // the order must follow containment depth, not area.
-            let mut cycles: Vec<Vec<(f64, bool, BezPath)>> = vec![Vec::new(); nr];
+            let mut cycles: Vec<Vec<(f64, bool, Path)>> = vec![Vec::new(); nr];
             let mut outer: Vec<Option<usize>> = vec![None; nr];
             for r in 0..nr {
                 let mut best: Option<(f64, usize)> = None;
                 for (ci, cyc) in faces[r].iter().enumerate() {
-                    let mut p = BezPath::new();
+                    let mut p = Path::new();
                     g.cycle_path(cyc, &mut p);
-                    let a = kurbo::Shape::area(&p).abs();
+                    let a = p.area().abs();
                     let borders_unpainted = cyc.iter().any(|&(id, _)| {
                         let e = &g.edges[id as usize];
                         let other = if e.left == r as u32 { e.right } else { e.left };
@@ -219,7 +219,7 @@ pub fn trace_color(img: &Raster, params: &Params, clock: &mut StageClock) -> Sce
                 }
             }
             for r in order {
-                let mut path = BezPath::new();
+                let mut path = Path::new();
                 for (i, (_, keep, p)) in cycles[r].iter().enumerate() {
                     if Some(i) == outer[r] || *keep {
                         path.extend(p.clone());

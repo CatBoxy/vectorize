@@ -14,7 +14,8 @@
 //! consecutive corners are joined by one straight line instead of two, so
 //! a square is four nodes, not eight.
 
-use kurbo::{BezPath, Point, Vec2};
+use crate::scene::Path;
+use kurbo::{Point, Vec2};
 
 const COS179: f64 = -0.999_847_695_156_391_3;
 
@@ -108,7 +109,7 @@ pub fn is_corner(prev: Point, v: Point, next: Point, alphamax: f64) -> bool {
 }
 
 /// Append one closed subpath for `segs` (as produced by [`fit`]).
-pub fn append_subpath(path: &mut BezPath, segs: &[Seg]) {
+pub fn append_subpath(path: &mut Path, segs: &[Seg]) {
     let m = segs.len();
     if m == 0 {
         return;
@@ -474,10 +475,10 @@ fn opticurve(cv: &Curve, opttolerance: f64) -> Curve {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kurbo::PathEl;
+    use crate::scene::El;
 
-    fn nodes(p: &BezPath) -> usize {
-        p.elements().iter().filter(|e| !matches!(e, PathEl::ClosePath)).count()
+    fn nodes(p: &Path) -> usize {
+        p.elements().iter().filter(|e| !matches!(e, El::Close)).count()
     }
 
     #[test]
@@ -485,11 +486,11 @@ mod tests {
         let v = [Point::new(0.0, 0.0), Point::new(10.0, 0.0), Point::new(10.0, 10.0), Point::new(0.0, 10.0)];
         let segs = fit(&v, 1.0, 0.2);
         assert!(segs.iter().all(|s| s.is_corner()));
-        let mut p = BezPath::new();
+        let mut p = Path::new();
         append_subpath(&mut p, &segs);
         assert_eq!(nodes(&p), 4);
-        assert!(matches!(p.elements()[0], PathEl::MoveTo(_)));
-        assert!(p.elements()[1..4].iter().all(|e| matches!(e, PathEl::LineTo(_))));
+        assert!(matches!(p.elements()[0], El::MoveTo(_)));
+        assert!(p.elements()[1..4].iter().all(|e| matches!(e, El::LineTo(_))));
     }
 
     #[test]
@@ -530,7 +531,7 @@ mod tests {
         let segs = fit(&v, 1.0, 0.2);
         assert!(segs[0].is_corner(), "{segs:?}");
         assert_eq!(segs.iter().filter(|s| s.is_corner()).count(), 2, "{segs:?}");
-        let mut p = BezPath::new();
+        let mut p = Path::new();
         append_subpath(&mut p, &segs);
         assert!(nodes(&p) <= 8, "{} nodes: {:?}", nodes(&p), p.elements());
     }

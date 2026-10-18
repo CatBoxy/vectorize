@@ -398,6 +398,43 @@ What M1 ended up as, and where it departs from the recipe above:
 - Output: one path per image, nonzero winding, consecutive corners joined by single lines.
 
 
+What M3 ended up as, and where it departs from the recipe above:
+- Corners: a polygon vertex is a corner by Potrace's alpha test, or when the polygon turns by at
+  least `min_turn` there and no single line, arc or cubic follows the contour from the previous
+  vertex to the next within the fit accuracy. The Corners slider drives both: alphamax 1.4 − 0.8c,
+  min_turn (40 − 40c)°. The accuracy test does not depend on edge lengths, which is where alpha alone
+  fails (thin-line ends, corners between short edges). Cut-corner vertex pairs are no longer merged
+  again at fit time (the polygon stage already did), so the 1 px end of a thin line keeps both corners.
+- Primitives: every run is tried as a line (chord deviation ≤ accuracy, `snap_lines`), then as a
+  circular arc (Kåsa least-squares circle, centre moved onto the chord's perpendicular bisector,
+  monotonic sweep, every sample within accuracy; emitted as an SVG `A`), then as a cubic. One arc
+  sweeps at most 170°: an `A` is defined by its ends and radius, and near 180° a chord shortened by
+  0.01 px of coordinate rounding sags a 100 px half circle by a pixel. A whole circle is three 120°
+  arcs. Circles are M + 3 arcs at every size (ΔE 0.01–0.15); pie@1024 went from 112 nodes to 7.
+  Axis-aligned snapping of line ends was not needed: measured contour points already sit on the axis.
+- Continuity across junctions: each chain end borrows five ghost points from the chain that continues
+  it through the junction (within 20° of straight), so end tangents are two-sided and the shared curve
+  meets smoothly. The least-squares junction point is only used when it is consistent with the
+  incident chains (0.25 px).
+- Node minimisation: the greedy exponential/binary search per run and the multi-start closed fit from
+  M1 stayed. Opticurve-style merging across smooth joins was not needed for the exit bar (52% of
+  VTracer's nodes at ΔE 0.54 vs 1.86), and accept-by-rasterization was not implemented: every
+  primitive is already checked against the sub-pixel samples, which is the same test at lower cost.
+- Found on the way: the seam between two abutting shapes rasterized on an opaque canvas is a 1 px line
+  of a tint containing the canvas (each shape anti-aliased separately shows white through). The M2
+  palette pass promoted that tint to a colour of its own, the speckle merge then handed its pixels to
+  either side, and the boundary became a staircase. Opaque images now explain such pixels as a mix of
+  two neighbours plus the canvas (background colour or white) and recover the coverage from the
+  painting order; transparent images show the same seam as partial alpha and were already handled.
+- Known gap: aliased input (no anti-aliasing at all: pixel art, binarised scans) carries no sub-pixel
+  information, the 0.2 px polygon tolerance then puts a vertex on every stair step, and the corner
+  model and arc fitter faithfully trace the jaggies. Potrace's 0.5 px tolerance is the fix, gated on
+  the absence of intermediate coverage values. Deferred to M6 hardening.
+- Numbers (full corpus, defaults): bw ΔE 0.33 / 31.3 nodes (M2: 0.36 / 34.0; Potrace 0.77 / 54.7);
+  colour abutting 0.93 / 258 (M2: 0.95 / 275; VTracer 2.56 / 390); synthetic 0.29 / 14.1. All sets:
+  ΔE 0.54 vs VTracer 1.86, nodes 110.7 vs 210.7, both `compare` gates pass at every size.
+
+
 1. `rustup update`; `cargo install wasm-pack vtracer resvg`; `sudo apt install potrace`.
 2. `cargo new --lib crates/core`, workspace Cargo.toml, `cargo add kurbo` in core.
 3. Corpus: script that downloads Simple Icons and OpenMoji SVGs, rasterizes with resvg at the
