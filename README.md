@@ -13,7 +13,7 @@ for the literature.
 | `crates/cli` | `vectorize in.png -o out.svg` |
 | `crates/bench` | Benchmark harness: corpus, metrics, baselines, report |
 | `crates/wasm` | wasm-bindgen wrapper: `trace(bytes, params_json)` → `{ svg, stats, stage_dumps? }`, and the PDF module |
-| `web/` | Next.js app: product UI + the Arena review game (M5 / MA) |
+| `web/` | Next.js app: the product UI (M5); the Arena review game (MA) is not built yet |
 | `corpus/` | Benchmark images (sources fetched by `corpus/fetch.sh`, not committed) |
 
 ## Bench quickstart
@@ -99,6 +99,28 @@ The budget (PLAN.md M5) is 400 KB gzipped: the tracer fits, the two together do 
 is a separate module the app fetches on first use. `-Os`, `-Oz` and `-O4` are all within 1% of `-O3` and
 `opt-level = 3` was kept for speed. The image crate is built with only its `png` and `jpeg` features;
 its defaults pull in rayon and codecs that do not build for wasm32.
+
+## Web app
+
+`web/` is the product page (Next.js 16, App Router): drop, paste or fetch an image, trace it in a Web
+Worker, compare the result side by side, as an overlay or behind a wipe, with a node overlay and zoom
+to 800%, inspect the pipeline's stage dumps, and export SVG, PNG or PDF. Nothing leaves the browser.
+
+```sh
+# Node >= 20.9 (24.11 was already installed here; otherwise `winget install OpenJS.NodeJS.LTS`)
+cd web
+npm install
+npm run build:wasm            # copies crates/wasm/pkg and pkg-pdf into public/wasm (add `-- --build` to run wasm-pack first)
+npm run dev                   # http://localhost:3000
+npm run build                 # production build, includes the type check
+```
+
+The worker loads `/wasm/vectorize_wasm.js` once and keeps the current image; slider changes re-trace
+after 150 ms of quiet, with one trace in flight and only the latest one queued. Inputs over 2048 px on
+the long edge are downscaled, with a warning in the status bar. `public/wasm` is a build output and is
+not committed: a deployment (Vercel, root directory `web`) has to run `npm run build:wasm -- --build`
+with Rust, the wasm32 target and wasm-pack installed, or commit the two packages. In the Claude desktop
+app, `preview_start` with the `vectorize-web` entry of `dev/.claude/launch.json` serves it on port 3001.
 
 ## Windows notes
 
