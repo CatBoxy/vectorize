@@ -435,6 +435,94 @@ What M3 ended up as, and where it departs from the recipe above:
   ΔE 0.54 vs VTracer 1.86, nodes 110.7 vs 210.7, both `compare` gates pass at every size.
 
 
+What M4 ended up as, and where it departs from the recipe above:
+- Polygon: the shortest cycle now minimises PolyFit's cost (`polygon.rs`, `PolygonCost::Polyfit`,
+  the default): one unit of simplicity per edge, an accuracy term (RMS deviation of the edge's points
+  relative to the tolerance, weight 0.5) and a continuity term (squared turning angle at every vertex,
+  weight 0.25, the curvature-variation cue: for a fixed total turn the squared penalty is smallest when
+  the turns are equal). States are edges rather than vertices so the turn between consecutive edges is
+  known; candidate ends of an edge are the end of its straight run, the next point, and the last eight
+  points of the run that extend the reach, which keeps the search linear on long straight edges. The
+  turn at vertex 0 is not scored (vertex 0 is a real corner of the contour whenever there is one; a
+  second pass per first edge doubled the cost for nothing measurable). Potrace's fewest-segments cost
+  stays behind `"polygon": "potrace"`. Measured on the colour set the two costs are within a node of
+  each other at equal ΔE, and the continuity weight makes no measurable difference between 0 and 0.25
+  either: the fitter works from the samples, not from the polygon, so the polygon only decides where
+  corners may be. The PolyFit search costs about twice Potrace's time on the bw set and 15% on colour
+  (`VECTORIZE_POLY_W` overrides the weights for experiments).
+- Sharp tips: a cut corner whose short edge has no measured flat between its vertices (fewer than two
+  points, or a chord under 1.5 px) may have its apex up to 4 px past the edge, and the merged vertex
+  may move that far during adjustment; and the biased zone around a corner now grows with sharpness
+  (`fit::corner_clear`, 0.75 / tan(θ/2) + 0.5 px, 1.5–5 px), for run samples and for primitive tests
+  alike. The star's tips were two corners 1.3 px apart at every size before this.
+- Regularity (`regularity.rs`, slider `regularity` 0..1, default 0.5): anchors are the corner vertices
+  plus the junctions (shared by every chain meeting there); lines are the runs already straight within
+  accuracy. Rules in order: axis alignment of lines ≥ 2 px within 6°·s, continuation of a line through a
+  junction, parallel lines of one face to their length-weighted mean direction, equal lengths within
+  8%·s, and mirror symmetry about a vertical or horizontal axis when every anchor of a face has a partner.
+  Every move is accepted only if no anchor strays more than 2 × accuracy × s from its measured position
+  and every line still passes within accuracy of its own samples; an anchor where a curve ends may only
+  slide along that curve's tangent, so a curve gets longer or shorter but never a kink (without that the
+  rules cost two nodes per colour image). Departures from PolyFit: the rules move the fitter's run end
+  points, not a spline, and the per-face shape is the boundary-graph face, so a snap on a shared edge
+  moves both shapes at once and stays gapless. On Simple Icons at 256 px the rules change 81 of 113
+  outputs for a total of +2 nodes; at 8× zoom the two versions are indistinguishable, which is the point
+  (sub-pixel moves) and also why the Arena, not the bench, has to judge them.
+- Corner classifier (`fit::classify_corners`): rule-based on PolyFit's features, no training (the Arena
+  labels do not exist). In order: open-chain ends are corners; a turn below `min_turn` is smooth; a turn
+  one line, arc or cubic follows from the previous vertex to the next within accuracy is smooth; a turn of
+  `strong_turn` or more is a corner; a turn between two edges both shorter than 2 px is smooth (no pixel
+  evidence); otherwise the two sides are fitted separately and their tangents at the vertex compared,
+  within `g1_angle` they join smoothly. The Corners slider drives min_turn (40° → 0°), strong_turn
+  (100° → 50°) and g1_angle (20° → 10°). Potrace alpha is gone from the default path (it misses the 60°
+  corners of a hexagon and depends on edge-length ratios); `VECTORIZE_CLASSIFIER=m3` restores it. Against
+  the M3 rule the new one saves 0.4 nodes per bw image and 0.8 per colour image at equal ΔE.
+- Primitives (`primitives.rs`, `primitives: true`): regular polygon and star (from the classified
+  corners: equal angular slots, one or two radii), full circle (three arcs, as before), ellipse (from the
+  area moments, refined by Gauss-Newton on the first-order point distance; emitted as three elliptical
+  `A` arcs, `El::EllipseTo`) and rounded rectangle (orientation from the principal axes or the longest
+  side, extents from the straight parts, radius from a circle fit per corner zone; four lines and four
+  arcs). Each is accepted only if every sample is within accuracy of its outline, and on a smooth loop
+  only if it has no more nodes than the ordinary fit (a six-pixel blob is four cubics, not an eight-node
+  rounded rectangle; without that rule primitives cost 1.8 nodes per colour image). The synthetic
+  circle, ellipse, rounded rect, hexagon, square and star come out as M + 3, M + 3, 8, 6, 4 and 10 nodes
+  at all five sizes. Not attempted: primitives for faces made of several chains (a circle split by a
+  junction), rotated ellipses are fine but a rounded rectangle's rotation is only estimated, no
+  rasterize-and-compare (the sample test is the same check at lower cost).
+- Presets (`Params::preset`, JSON `"preset"` with per-field overrides laid over it): Logo (regularity 1),
+  Sketch (black and white, tolerance 0.3, corners 0.3, min_area 8, no line snapping, accuracy 0.5, no
+  regularity or primitives), Flat illustration (colour merge 0.025, min_area 2, regularity 0.25) and
+  Pixel art (nearest-neighbour upscale ×4, every bend a corner, min_area 1, no primitives; the scene is
+  scaled back so coordinates stay in source pixels and land on pixel edges). `color_merge` and `upscale`
+  are new parameters; the palette merge distance was a constant.
+- Found on the way: the bench hung once per full run on a different large colour JPEG each time, and the
+  same image traced alone in half a second. Speckle merging broke ties by hash-map iteration order and
+  the palette's seed order did too, so one run in a thousand produced a different region map and, in
+  rare cases, a chain the fitter chokes on. Ties now go to the nearest colour (then the lowest region
+  id) and equal histogram counts to key order. The nearest-colour rule alone took the colour set from
+  257.9 to 237.9 nodes at better ΔE (0.93 → 0.92): JPEG speckles
+  merge coherently instead of at random. Everything is deterministic now.
+- Numbers (full corpus, defaults):
+
+| size | ΔE ours | ΔE VTracer | nodes ours | nodes VTracer | M3 ΔE / nodes | ms ours |
+|---|---|---|---|---|---|---|
+| 64 | 1.42 | 4.24 | 60.7 | 95.9 | 1.42 / 62.5 | 7.7 |
+| 128 | 0.65 | 2.33 | 63.4 | 129.9 | 0.65 / 65.8 | 16.2 |
+| 256 | 0.34 | 1.34 | 81.6 | 174.7 | 0.34 / 87.5 | 29.4 |
+| 512 | 0.18 | 0.81 | 118.8 | 246.7 | 0.18 / 129.3 | 71.9 |
+| 1024 | 0.10 | 0.56 | 190.3 | 406.2 | 0.10 / 208.2 | 206.4 |
+
+  bw ΔE 0.33 / 30.4 nodes (M3 0.33 / 31.3; Potrace 0.77 / 54.7); colour abutting 0.92 / 237.9
+  (M3 0.93 / 257.9; VTracer 2.56 / 390); synthetic 0.28 / 13.3 (M3 0.29 / 14.2). All sets: ΔE 0.54 vs VTracer
+  1.86, nodes 103.0 vs 210.7 (49%). Both `compare` gates pass at every size, and so does `compare M3base M4`.
+  Average time per image 66 ms against 43 ms for M3 (the PolyFit search and the primitive tests).
+- The exit criterion is not measured. The Arena (MA) does not exist yet, so the blind preference against
+  VTracer (≥ 80%) and Illustrator (≥ 50%) and the node count against Vectorizer.AI on the 12 reference
+  images are open; nothing above should be read as meeting them. The bench says what it can: fewer nodes
+  than M3 at equal or better error at every size, and the synthetic primitives come out as primitives.
+  Looked at by eye: the 20 worst images of the M4 report (by wrong-pixel %, contact sheet of input / trace / ΔE heat) are all 64 px, nineteen of them colour emoji (mostly the JPEG copies) plus the Starbucks logo. Every trace reads as the right picture, with the right colours, no seams and nothing missing; the error heat sits on the 1–2 px dark outlines that every emoji has at that size and on the dartboard's concentric 1 px rings (671 nodes, the hardest image in the corpus), where sub-pixel placement and JPEG ringing dominate. None of them is an M4 failure class; they are the resolution limit, and M6's aliased-input work is where they belong.
+
+
 1. `rustup update`; `cargo install wasm-pack vtracer resvg`; `sudo apt install potrace`.
 2. `cargo new --lib crates/core`, workspace Cargo.toml, `cargo add kurbo` in core.
 3. Corpus: script that downloads Simple Icons and OpenMoji SVGs, rasterizes with resvg at the

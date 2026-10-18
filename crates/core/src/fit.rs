@@ -13,7 +13,6 @@
 //! through the measured boundary instead of through chord midpoints (the
 //! bias Potrace's `smooth` has, about a third of a pixel on a circle).
 
-use crate::contour::Contour;
 use crate::scene::{El, Path};
 use kurbo::{fit_to_cubic, CubicBez, CurveFitSample, ParamCurveFit, ParamCurveNearest, Point, Vec2};
 use std::ops::Range;
@@ -323,7 +322,7 @@ fn fit_is_sane(els: &[El], samples: &[Point], accuracy: f64) -> bool {
     let bb = bb.inflate(m, m);
     els.iter().all(|e| match *e {
         El::CurveTo(a, b, p) => bb.contains(a) && bb.contains(b) && bb.contains(p),
-        El::LineTo(p) | El::ArcTo { end: p, .. } => bb.contains(p),
+        El::LineTo(p) | El::ArcTo { end: p, .. } | El::EllipseTo { end: p, .. } => bb.contains(p),
         _ => true,
     })
 }
@@ -681,24 +680,52 @@ pub fn fit_run_ghost(samples: &[Point], prefix: &[Point], suffix: &[Point], o: &
 /// Options for deciding which polygon vertices are corners.
 #[derive(Clone, Copy, Debug)]
 pub struct CornerOpts {
-    /// Potrace alpha threshold.
+    /// Potrace alpha threshold (used by the Potrace curve fitter only).
     pub alphamax: f64,
     /// Below this turning angle (radians) a vertex is never a corner.
     pub min_turn: f64,
+    /// At or above this turning angle (radians) a vertex is always a
+    /// corner, whatever the fits say.
+    pub strong_turn: f64,
+    /// The two sides' tangents at the vertex may differ by this much
+    /// (radians) and still join smoothly.
+    pub g1_angle: f64,
+    /// A vertex between two polygon edges both shorter than this (px) is
+    /// below the raster's resolution and never a corner unless the turn is
+    /// strong.
+    pub short_edge: f64,
     pub accuracy: f64,
     pub window: f64,
 }
 
-/// Which polygon vertices are corners (PLAN.md M3): Potrace's alpha test,
-/// or, when the polygon turns by at least `min_turn` there, the accuracy
-/// test: a vertex is a corner if no single cubic fits the contour from the
-/// previous vertex to the next within `accuracy`. That second test does not
-/// depend on the polygon's edge lengths, which is where alpha alone fails
-/// (corners next to short edges, ends of thin lines). For an open chain
-/// both ends are corners.
+/// Arc length on each side of a vertex over which its side tangents are
+/// measured, px.
+pub const TANGENT_SPAN: f64 = 4.0;
+/// Polygon edges shorter than this carry no evidence of a corner (PolyFit
+/// uses the same 2 px for axis alignment), px.
+pub const SHORT_EDGE: f64 = 2.0;
+
+/// Which polygon vertices are corners (PLAN.md M3, rewritten in M4 as a
+/// rule-based classifier on PolyFit's features: the fit accuracy of each
+/// configuration, the polygon angle, the edge lengths and the raster
+/// resolution in pixels). In order:
+/// 1. the ends of an open chain are corners;
+/// 2. a turn below `min_turn` is smooth;
+/// 3. a turn one line, arc or cubic follows from the previous vertex to the
+///    next within `accuracy` is smooth (the one-curve configuration fits);
+/// 4. a turn of `strong_turn` or more is a corner;
+/// 5. a turn between two edges shorter than `short_edge` is smooth: there
+///    is no pixel evidence for a corner that small;
+/// 6. otherwise the two sides are fitted separately and their tangents at
+///    the vertex compared: within `g1_angle` they join smoothly (the
+///    two-curve configuration fits), beyond it the vertex is a corner.
+/// Unlike Potrace's alpha test, none of this depends on the ratio of the
+/// adjacent edge lengths, which is where alpha fails (thin-line ends,
+/// corners between short edges, 60° corners of a hexagon).
 pub fn classify_corners(pts: &[Point], fit_ok: &[bool], verts: &[Point], po: &[usize], closed: bool, o: &CornerOpts) -> Vec<bool> {
     let m = verts.len();
     let n = pts.len();
+    let dbg = std::env::var("VECTORIZE_DEBUG").as_deref() == Ok("corners");
     (0..m)
         .map(|i| {
             if !closed && (i == 0 || i == m - 1) {
@@ -709,44 +736,125 @@ pub fn classify_corners(pts: &[Point], fit_ok: &[bool], verts: &[Point], po: &[u
             }
             let (ip, inx) = ((i + m - 1) % m, (i + 1) % m);
             let (p, v, q) = (verts[ip], verts[i], verts[inx]);
-            if crate::curve::is_corner(p, v, q, o.alphamax) {
-                return true;
-            }
             let (a, b) = (v - p, q - v);
             let turn = a.cross(b).atan2(a.dot(b)).abs();
-            if turn < o.min_turn {
-                return false;
-            }
-            let span = if closed { (po[inx] + n - po[ip]) % n } else { po[inx].saturating_sub(po[ip]) };
-            if span == 0 {
-                return false;
-            }
-            let mut samples = Vec::with_capacity(span + 1);
-            samples.push(p);
-            let mut k = (po[ip] + 1) % n;
-            for _ in 1..span {
-                if fit_ok[k] {
-                    samples.push(pts[k]);
+            let why;
+            let corner = if turn < o.min_turn {
+                why = "below min_turn";
+                false
+            } else {
+                // Samples from the previous vertex to the next, with the
+                // vertex's own contour index to split the two sides.
+                let span = if closed { (po[inx] + n - po[ip]) % n } else { po[inx].saturating_sub(po[ip]) };
+                let mut left = vec![p];
+                let mut right = Vec::new();
+                let at_v = if closed { (po[i] + n - po[ip]) % n } else { po[i].saturating_sub(po[ip]) };
+                let mut k = (po[ip] + 1) % n;
+                for s in 1..span {
+                    if fit_ok[k] {
+                        if s <= at_v { left.push(pts[k]) } else { right.push(pts[k]) }
+                    }
+                    k = (k + 1) % n;
                 }
-                k = (k + 1) % n;
-            }
-            samples.push(q);
-            let smooth = smooth_across(&samples, o);
-            if std::env::var("VECTORIZE_DEBUG").as_deref() == Ok("corners") {
-                let src = PolySource::new(&samples, false, o.window);
-                let prim = if src.len() >= 3 { try_prim(&src, 0, src.len() - 1, o.accuracy, true) } else { None };
+                right.push(q);
+                let mut all = left.clone();
+                all.extend_from_slice(&right);
+                let m3 = std::env::var("VECTORIZE_CLASSIFIER").as_deref() == Ok("m3");
+                if m3 && crate::curve::is_corner(p, v, q, o.alphamax) {
+                    why = "alpha (m3)";
+                    true
+                } else if span == 0 || smooth_across(&all, o) {
+                    why = "one primitive fits";
+                    false
+                } else if m3 {
+                    why = "no primitive (m3)";
+                    true
+                } else if turn >= o.strong_turn {
+                    why = "strong turn";
+                    true
+                } else if a.hypot() < o.short_edge && b.hypot() < o.short_edge {
+                    why = "both edges short";
+                    false
+                } else {
+                    // Tangent of each side at the vertex, from the samples
+                    // within TANGENT_SPAN of it.
+                    let tin = side_tangent(&left, v, true, o.accuracy);
+                    let tout = side_tangent(&right, v, false, o.accuracy);
+                    match (tin, tout) {
+                        (Some(ti), Some(to)) => {
+                            let g = ti.cross(to).atan2(ti.dot(to)).abs();
+                            if g <= o.g1_angle {
+                                why = "sides join G1";
+                                false
+                            } else {
+                                why = "sides do not join";
+                                true
+                            }
+                        }
+                        _ => {
+                            why = "no side tangents";
+                            true
+                        }
+                    }
+                }
+            };
+            if dbg {
                 eprintln!(
-                    "corner? v{i} ({:.2},{:.2}) turn {:.1}° {} samples -> smooth {smooth} via {:?}",
+                    "corner? v{i} ({:.2},{:.2}) turn {:.1}° edges {:.1}/{:.1} px -> {} ({why})",
                     v.x,
                     v.y,
                     turn.to_degrees(),
-                    samples.len(),
-                    prim.map(|p| p.el())
+                    a.hypot(),
+                    b.hypot(),
+                    if corner { "corner" } else { "smooth" }
                 );
             }
-            !smooth
+            corner
         })
         .collect()
+}
+
+/// Unit tangent of one side of a vertex at the vertex: the least-squares
+/// line through the side's samples within [`TANGENT_SPAN`] of `v`
+/// (at least two, else the nearest two), oriented along the boundary. The
+/// vertex itself is used only when there is a single sample. `incoming`
+/// sides end at `v`, the others start there.
+fn side_tangent(samples: &[Point], v: Point, incoming: bool, accuracy: f64) -> Option<Vec2> {
+    let mut near: Vec<Point> = samples.iter().copied().filter(|p| (*p - v).hypot() <= TANGENT_SPAN && (*p - v).hypot() > 0.5 * accuracy).collect();
+    if near.len() < 2 {
+        // Fall back to the two nearest samples, or the nearest and `v`.
+        let mut sorted: Vec<Point> = samples.iter().copied().filter(|p| (*p - v).hypot() > 0.5 * accuracy).collect();
+        sorted.sort_by(|a, b| (*a - v).hypot().partial_cmp(&(*b - v).hypot()).unwrap());
+        near = sorted.into_iter().take(2).collect();
+        if near.len() == 1 {
+            near.push(v);
+        }
+        if near.len() < 2 {
+            return None;
+        }
+    }
+    let n = near.len() as f64;
+    let c = Point::new(near.iter().map(|p| p.x).sum::<f64>() / n, near.iter().map(|p| p.y).sum::<f64>() / n);
+    let (mut sxx, mut sxy, mut syy) = (0.0, 0.0, 0.0);
+    for p in &near {
+        let (dx, dy) = (p.x - c.x, p.y - c.y);
+        sxx += dx * dx;
+        sxy += dx * dy;
+        syy += dy * dy;
+    }
+    if sxx + syy < 1e-12 {
+        return None;
+    }
+    let theta = 0.5 * (2.0 * sxy).atan2(sxx - syy);
+    let mut dir = Vec2::new(theta.cos(), theta.sin());
+    // Orient along the boundary: toward `v` for the incoming side, away
+    // from it for the outgoing one. The far sample is the reference.
+    let far = near.iter().copied().max_by(|a, b| (*a - v).hypot().partial_cmp(&(*b - v).hypot()).unwrap()).unwrap();
+    let toward_v = v - far;
+    if (if incoming { dir.dot(toward_v) } else { -dir.dot(toward_v) }) < 0.0 {
+        dir = -dir;
+    }
+    Some(dir)
 }
 
 /// Can one primitive (line, arc or cubic) follow `samples` end to end
@@ -879,71 +987,126 @@ pub fn fit_run(samples: &[Point], closed: bool, o: &FitOpts) -> (Point, Vec<El>)
     (start, els)
 }
 
-/// Append one closed subpath: the loop `c`, polygonised into `verts` at
-/// contour indices `po`, with `corner[i]` marking sharp vertices.
-pub fn append_loop(path: &mut Path, c: &Contour, verts: &[Point], po: &[usize], corner: &[bool], o: &FitOpts) {
-    let n = c.pts.len();
-    let m = verts.len();
-    if n == 0 || m == 0 {
-        return;
-    }
-    // Cut-corner vertex pairs were merged by the polygon stage; what is
-    // left a pixel apart is a real short edge, such as the end of a line.
-    let corners: Vec<usize> = (0..m).filter(|&i| corner[i]).collect();
-    let mut els_all: Vec<El> = Vec::new();
-    let start;
-    if corners.is_empty() {
-        // One closed run over every usable point, starting at vertex 0.
-        let first = po[0] % n;
-        let samples: Vec<Point> = (0..n)
-            .map(|k| (first + k) % n)
-            .filter(|&k| c.fit_ok[k])
-            .map(|k| c.pts[k])
-            .collect();
-        if samples.len() < 3 {
-            return;
-        }
-        let (s, els) = fit_run(&samples, true, o);
-        start = s;
-        els_all = els;
+/// One run between two consecutive anchors (corner vertices or junctions),
+/// planned before the anchors are regularised (PLAN.md M4) and fitted
+/// after: the samples never move, the end points may.
+#[derive(Clone, Debug)]
+pub struct Run {
+    /// Usable samples strictly between the anchors, at least
+    /// [`CORNER_CLEAR`] from both.
+    pub samples: Vec<Point>,
+    /// Straight within accuracy: emitted as a single line between the
+    /// anchors, whatever the regulariser does to them (within accuracy).
+    pub line: bool,
+}
+
+/// How far from a corner with turning angle `turn` (radians) the measured
+/// points are biased. Within a corner the pixel pairs across one edge are
+/// also cut by the other edge, so their coverage reads the wrong position.
+/// Where the shape is narrower than about a pixel and a half that bias is
+/// unavoidable: at distance `d` from the apex of a tip with interior angle
+/// `θ = π − turn` the shape is `2 d tan(θ/2)` wide, so the biased zone
+/// reaches `0.75 / tan(θ/2)` plus half a pixel, never less than
+/// [`CORNER_CLEAR`] and never more than [`TIP_CLEAR_MAX`].
+pub fn corner_clear(turn: f64) -> f64 {
+    let half = 0.5 * (std::f64::consts::PI - turn.abs()).max(1e-3);
+    (0.75 / half.tan() + 0.5).clamp(CORNER_CLEAR, TIP_CLEAR_MAX)
+}
+
+/// Longest corner clearance, px (a 20° tip).
+pub const TIP_CLEAR_MAX: f64 = 5.0;
+
+/// Turning angle at `v` between `p → v` and `v → q`, radians in `0..=π`.
+pub fn turn_at(p: Point, v: Point, q: Point) -> f64 {
+    let (a, b) = (v - p, q - v);
+    a.cross(b).atan2(a.dot(b)).abs()
+}
+
+/// Samples of the run from contour index `ia` to `ib` between the anchors
+/// `va` and `vb`: every usable point strictly between them and clear of
+/// both (`clear_a`, `clear_b`, from [`corner_clear`]). A corner vertex is
+/// the intersection of two fitted edge lines, which on an anti-aliased
+/// corner lies past the stair-step points around it; those would put a hook
+/// on the corner.
+pub fn run_samples(pts: &[Point], fit_ok: &[bool], ia: usize, ib: usize, closed: bool, va: Point, vb: Point, clear_a: f64, clear_b: f64) -> Vec<Point> {
+    let n = pts.len();
+    let steps = if closed {
+        let s = (ib + n - ia) % n;
+        if s == 0 { n } else { s }
     } else {
-        start = verts[corners[0]];
-        // A corner vertex is the intersection of the two fitted edge lines,
-        // which on an anti-aliased corner lies past the stair-step points
-        // around it. Those points would put a hook on the corner, so leave
-        // out every sample within `clear` of either end vertex.
-        let clear = CORNER_CLEAR;
-        for (ci, &a) in corners.iter().enumerate() {
-            let b = corners[(ci + 1) % corners.len()];
-            let (ia, ib) = (po[a] % n, po[b] % n);
-            let steps = (ib + n - ia) % n;
-            let steps = if steps == 0 { n } else { steps };
-            let (va, vb) = (verts[a], verts[b]);
-            let mut samples = Vec::with_capacity(steps + 1);
-            samples.push(va);
-            let mut k = (ia + 1) % n;
-            for _ in 1..steps {
-                let p = c.pts[k];
-                if c.fit_ok[k] && (p - va).hypot() > clear && (p - vb).hypot() > clear {
-                    samples.push(p);
-                }
-                k = (k + 1) % n;
-            }
-            samples.push(vb);
-            els_all.extend(fit_run(&samples, false, o).1);
+        ib.saturating_sub(ia)
+    };
+    let mut out = Vec::with_capacity(steps);
+    let mut k = (ia + 1) % n;
+    for _ in 1..steps {
+        let p = pts[k];
+        if fit_ok[k] && (p - va).hypot() > clear_a && (p - vb).hypot() > clear_b {
+            out.push(p);
         }
+        k = (k + 1) % n;
     }
-    if els_all.is_empty() {
+    out
+}
+
+/// Tangent directions of a curved run at its two anchors, for the
+/// regulariser: from the anchor toward the nearest samples. `None` for a
+/// line or a run without samples.
+pub fn run_end_tangents(run: &Run, va: Point, vb: Point) -> Option<(Vec2, Vec2)> {
+    if run.line || run.samples.is_empty() {
+        return None;
+    }
+    let k = run.samples.len().min(3);
+    let first = run.samples[k - 1];
+    let last = run.samples[run.samples.len() - k];
+    Some((first - va, vb - last))
+}
+
+/// Plan one run: is it a line?
+pub fn plan_run(samples: Vec<Point>, va: Point, vb: Point, o: &FitOpts) -> Run {
+    let line = o.snap_lines && {
+        let mut all = Vec::with_capacity(samples.len() + 2);
+        all.push(va);
+        all.extend_from_slice(&samples);
+        all.push(vb);
+        chord_deviation(&all).map_or(false, |d| d <= o.accuracy)
+    };
+    Run { samples, line }
+}
+
+/// Elements (no `MoveTo`) of one run from `va` to `vb`. `prefix` and
+/// `suffix` are ghost points shaping the end tangents (see
+/// [`fit_run_ghost`]).
+pub fn emit_run(run: &Run, va: Point, vb: Point, prefix: &[Point], suffix: &[Point], o: &FitOpts) -> Vec<El> {
+    if run.line || run.samples.is_empty() {
+        return vec![El::LineTo(vb)];
+    }
+    let mut all = Vec::with_capacity(run.samples.len() + 2);
+    all.push(va);
+    all.extend_from_slice(&run.samples);
+    all.push(vb);
+    if prefix.is_empty() && suffix.is_empty() {
+        fit_run(&all, false, o).1
+    } else {
+        fit_run_ghost(&all, prefix, suffix, o)
+    }
+}
+
+/// Close a loop's elements: drop a final line back to `start` (implied by
+/// `Z`) and append everything to `path`.
+pub fn push_loop(path: &mut Path, start: Point, mut els: Vec<El>) {
+    if els.is_empty() {
         return;
     }
-    // The closing line is implied by `Z`.
-    if let Some(El::LineTo(p)) = els_all.last() {
+    if let Some(El::LineTo(p)) = els.last() {
         if (*p - start).hypot() < 1e-9 {
-            els_all.pop();
+            els.pop();
         }
+    }
+    if els.is_empty() {
+        return;
     }
     path.move_to(start);
-    for e in els_all {
+    for e in els {
         path.push(e);
     }
     path.close_path();
@@ -1078,6 +1241,130 @@ mod tests {
         let o = FitOpts { accuracy: 0.3, snap_lines: true, window: 1.0 };
         let (_, els) = fit_run(&pts, false, &o);
         assert!(!els.is_empty() && els.len() <= 6, "{els:?}");
+    }
+
+    fn copts() -> CornerOpts {
+        CornerOpts {
+            alphamax: 1.0,
+            min_turn: 20f64.to_radians(),
+            strong_turn: 75f64.to_radians(),
+            g1_angle: 15f64.to_radians(),
+            short_edge: 2.0,
+            accuracy: 0.35,
+            window: 1.0,
+        }
+    }
+
+    /// Dense samples along a closed polygon, half a pixel apart, with the
+    /// polygon vertices as `verts` and their sample indices as `po`.
+    fn sampled_polygon(verts: &[Point]) -> (Vec<Point>, Vec<bool>, Vec<usize>) {
+        let mut pts = Vec::new();
+        let mut po = Vec::new();
+        for i in 0..verts.len() {
+            let (a, b) = (verts[i], verts[(i + 1) % verts.len()]);
+            let n = ((b - a).hypot() * 2.0).ceil().max(1.0) as usize;
+            po.push(pts.len());
+            for k in 0..n {
+                pts.push(a.lerp(b, k as f64 / n as f64));
+            }
+        }
+        let ok = vec![true; pts.len()];
+        (pts, ok, po)
+    }
+
+    #[test]
+    fn classifier_rules_on_polygon_angle_edge_length_and_fit() {
+        let o = copts();
+        // A hexagon's 60° corners (which Potrace alpha misses) are corners:
+        // no single primitive follows two 40 px straight edges around them.
+        let hexagon: Vec<Point> = (0..6)
+            .map(|k| {
+                let a = k as f64 * std::f64::consts::TAU / 6.0;
+                Point::new(50.0 + 40.0 * a.cos(), 50.0 + 40.0 * a.sin())
+            })
+            .collect();
+        let (pts, ok, po) = sampled_polygon(&hexagon);
+        let c = classify_corners(&pts, &ok, &hexagon, &po, true, &o);
+        assert!(c.iter().all(|&b| b), "{c:?}");
+        // A regular 24-gon approximating a circle: turns of 15° are below
+        // min_turn and every vertex is smooth.
+        let poly24: Vec<Point> = (0..24)
+            .map(|k| {
+                let a = k as f64 * std::f64::consts::TAU / 24.0;
+                Point::new(50.0 + 40.0 * a.cos(), 50.0 + 40.0 * a.sin())
+            })
+            .collect();
+        let (pts, ok, po) = sampled_polygon(&poly24);
+        let c = classify_corners(&pts, &ok, &poly24, &po, true, &o);
+        assert!(c.iter().all(|&b| !b), "{c:?}");
+        // A 1 px thin line end: two 90° turns 1 px apart are corners (strong
+        // turn), even though both edges at each are short on one side.
+        let bar = vec![Point::new(0.0, 0.0), Point::new(30.0, 0.0), Point::new(30.0, 1.0), Point::new(0.0, 1.0)];
+        let (pts, ok, po) = sampled_polygon(&bar);
+        let c = classify_corners(&pts, &ok, &bar, &po, true, &o);
+        assert!(c.iter().all(|&b| b), "{c:?}");
+        // A 40° zigzag between 1 px edges on an otherwise straight boundary
+        // is below the resolution: not a corner.
+        let notch = vec![
+            Point::new(0.0, 0.0),
+            Point::new(20.0, 0.0),
+            Point::new(20.8, 0.6),
+            Point::new(21.6, 0.0),
+            Point::new(40.0, 0.0),
+            Point::new(40.0, 30.0),
+            Point::new(0.0, 30.0),
+        ];
+        let (pts, ok, po) = sampled_polygon(&notch);
+        let c = classify_corners(&pts, &ok, &notch, &po, true, &o);
+        assert!(!c[2], "{c:?}");
+        // The ends of an open chain are always corners.
+        let (pts, ok, po) = sampled_polygon(&bar);
+        let c = classify_corners(&pts, &ok, &bar[..3], &po[..3], false, &o);
+        assert!(c[0] && c[2]);
+    }
+
+    #[test]
+    fn side_tangents_tell_a_smooth_join_from_a_corner() {
+        // A quarter circle meeting a tangent line: the join is G1, so with a
+        // single primitive refused (the span is too long for one arc or
+        // cubic), the side tangents agree and the vertex is smooth.
+        let r = 30.0;
+        let mut verts = vec![Point::new(-60.0, r)];
+        let mut pts = vec![Point::new(-60.0, r)];
+        for k in 1..=60 {
+            pts.push(Point::new(-60.0 + k as f64, r));
+        }
+        verts.push(Point::new(0.0, r));
+        let v_join = pts.len() - 1;
+        for k in 1..=90 {
+            let a = std::f64::consts::FRAC_PI_2 - k as f64 * std::f64::consts::FRAC_PI_2 / 90.0;
+            pts.push(Point::new(r * a.cos(), r * a.sin()));
+        }
+        verts.push(Point::new(r, 0.0));
+        // Close with a far-away corner so the loop is a closed polygon.
+        pts.push(Point::new(r, -40.0));
+        verts.push(Point::new(r, -40.0));
+        pts.push(Point::new(-60.0, -40.0));
+        verts.push(Point::new(-60.0, -40.0));
+        let po = vec![0usize, v_join, v_join + 90, v_join + 91, v_join + 92];
+        let ok = vec![true; pts.len()];
+        let o = copts();
+        let ti = side_tangent(&pts[..=v_join], verts[1], true, o.accuracy).unwrap();
+        let to = side_tangent(&pts[v_join + 1..=v_join + 90], verts[1], false, o.accuracy).unwrap();
+        assert!(ti.cross(to).atan2(ti.dot(to)).abs() < o.g1_angle, "{ti:?} {to:?}");
+        let c = classify_corners(&pts, &ok, &verts, &po, true, &o);
+        assert!(!c[1], "line-to-arc join classified as a corner: {c:?}");
+        // The arc leaves heading straight down into the vertical edge: also
+        // a tangent-continuous join. The two bottom corners are corners.
+        assert!(!c[2] && c[3] && c[4] && c[0], "{c:?}");
+    }
+
+    #[test]
+    fn corner_clearance_grows_with_sharpness() {
+        assert!((corner_clear(90f64.to_radians()) - CORNER_CLEAR).abs() < 1e-9);
+        let tip36 = corner_clear(144f64.to_radians());
+        assert!(tip36 > 2.5 && tip36 < 3.5, "{tip36}");
+        assert_eq!(corner_clear(170f64.to_radians()), TIP_CLEAR_MAX);
     }
 
     #[test]

@@ -8,6 +8,9 @@ description = "Raster to SVG tracer core: pure, no I/O, no threads"
 [lib]
 name = "vectorize_core"
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [dependencies]
 kurbo.workspace = true
 serde.workspace = true

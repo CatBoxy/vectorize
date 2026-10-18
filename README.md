@@ -46,14 +46,27 @@ the palette; `ignore_background` drops the border-majority colour. `curve_fit` i
 the dense sub-pixel contour between corners) or `potrace` (Selinger's smooth + opticurve on the polygon),
 kept for comparison.
 
-`corners` (0..1) is the Corners slider: 0 only keeps sharp corners, 1 keeps every turn (M3 corner model:
-Potrace alpha, or a turn that no single line, arc or cubic can follow within `fit_accuracy`). `snap_lines`
-turns straight runs into `L` commands; circular runs become `A` arcs regardless (a circle is three arcs).
+`corners` (0..1) is the Corners slider: 0 only keeps sharp corners, 1 keeps every turn (M4 corner model:
+a rule-based classifier on the polygon angle, the edge lengths and whether one curve, or two curves
+joining smoothly, can follow the boundary within `fit_accuracy`). `snap_lines` turns straight runs into
+`L` commands; circular runs become `A` arcs regardless (a circle is three arcs).
+
+M4 controls: `preset` is `logo`, `sketch`, `flat_illustration` or `pixel_art`; the preset's values apply
+first and any other field in the JSON overrides them. `polygon` is `polyfit` (default: simplicity +
+accuracy + continuity cost) or `potrace` (fewest segments). `regularity` (0..1, default 0.5) snaps nearly
+axis-aligned, parallel, equal-length and mirror-symmetric edges and continues lines through junctions,
+never beyond `fit_accuracy`. `primitives` (default true) emits whole circles, ellipses, rounded rectangles,
+regular polygons and stars as such. `color_merge` is the OKLab distance below which palette clusters
+merge. `upscale` traces a nearest-neighbour enlargement and scales the result back (the pixel-art preset
+uses 4).
 
 Debugging: `VECTORIZE_DEBUG=1` prints a summary per stage; `=elbows`, `=chains`, `=edges`, `=stack`,
-`=junctions`, `=corners`, `=closed` and `=trace` print the contour points, boundary chains, per-edge fit
-counts, stacking order, junction refinement, corner decisions, closed-loop fits and fitter calls;
-`VECTORIZE_PROBE=x,y` prints the colour mix of the pixels around a point.
+`=junctions`, `=corners`, `=closed`, `=trace`, `=prims` and `=merge` print the contour points, boundary
+chains, per-edge fit counts, stacking order, junction refinement, corner decisions, closed-loop fits,
+fitter calls, primitive hypotheses and cut-corner merges; `VECTORIZE_PROBE=x,y` prints the colour mix of
+the pixels around a point. For experiments, `VECTORIZE_REG_SKIP=axis,junction,parallel,equal,mirror`
+turns regularity rules off, `VECTORIZE_CLASSIFIER=m3` restores the M3 corner test and
+`VECTORIZE_POLY_W=acc,cont` overrides the polygon cost weights.
 
 ## Windows notes
 
