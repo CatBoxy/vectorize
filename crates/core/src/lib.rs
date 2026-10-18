@@ -28,8 +28,10 @@ pub mod mix;
 pub mod palette;
 pub mod params;
 pub mod polygon;
+pub mod primitives;
 pub mod raster;
 pub mod regions;
+pub mod regularity;
 pub mod scene;
 pub mod svg;
 
@@ -60,10 +62,26 @@ pub struct Traced {
 /// Trace a raster image into an SVG scene.
 pub fn trace(img: &Raster, params: &Params) -> Traced {
     let mut clock = StageClock::start();
-    let scene = match params.mode {
-        params::Mode::BlackAndWhite => bw::trace_bw(img, params, &mut clock),
-        params::Mode::Grayscale | params::Mode::Color => color::trace_color(img, params, &mut clock),
+    // Pixel art (PLAN.md M4): trace a nearest-neighbour upscale, where every
+    // source pixel is a crisp block, and scale the result back.
+    let k = params.upscale.clamp(1, 16);
+    let big;
+    let src = if k > 1 && img.width > 0 && img.height > 0 && img.width * k <= 8192 && img.height * k <= 8192 {
+        big = raster::upscale_nearest(img, k);
+        clock.lap("upscale");
+        &big
+    } else {
+        img
     };
+    let mut scene = match params.mode {
+        params::Mode::BlackAndWhite => bw::trace_bw(src, params, &mut clock),
+        params::Mode::Grayscale | params::Mode::Color => color::trace_color(src, params, &mut clock),
+    };
+    if std::ptr::eq(src, img) == false {
+        scene.scale(1.0 / k as f64);
+        scene.width = img.width;
+        scene.height = img.height;
+    }
     finish(scene, clock)
 }
 
@@ -241,6 +259,30 @@ mod tests {
     }
 
     #[test]
+    fn pixel_art_upscale_keeps_pixel_edges_in_source_units() {
+        // A 6×6 aliased image: a 2×2 block plus a diagonal pixel.
+        let mut img = Raster::filled(6, 6, [255, 255, 255, 255]);
+        for (x, y) in [(2, 2), (3, 2), (2, 3), (3, 3), (4, 4)] {
+            img.set(x, y, [0, 0, 0, 255]);
+        }
+        let p = Params::preset(params::Preset::PixelArt);
+        let out = trace(&img, &Params { mode: params::Mode::BlackAndWhite, ..p });
+        assert!(out.svg.contains("viewBox=\"0 0 6 6\""), "{}", out.svg);
+        // Every coordinate is a whole source pixel edge.
+        for s in &out.scene.shapes {
+            for el in s.path.elements() {
+                if let Some(q) = el.end() {
+                    assert!((q.x - q.x.round()).abs() < 1e-6 && (q.y - q.y.round()).abs() < 1e-6, "{q:?}");
+                }
+            }
+        }
+        // The default trace of the same image smooths the diagonal pixel
+        // into fewer nodes than the blocky pixel-art trace.
+        let smooth = trace(&img, &Params { mode: params::Mode::BlackAndWhite, min_area: 1, ..Params::default() });
+        assert!(out.stats.nodes >= 8 && out.stats.nodes > smooth.stats.nodes, "{} vs {}", out.stats.nodes, smooth.stats.nodes);
+    }
+
+    #[test]
     fn noise_never_panics_and_paths_close() {
         let mut seed = 0x1234_5678u32;
         for size in [1u32, 2, 3, 7, 16, 33] {
@@ -262,7 +304,7 @@ mod tests {
                     for p in match *el {
                         El::MoveTo(p) | El::LineTo(p) => vec![p],
                         El::CurveTo(a, b, p) => vec![a, b, p],
-                        El::ArcTo { end, .. } => vec![end],
+                        El::ArcTo { end, .. } | El::EllipseTo { end, .. } => vec![end],
                         El::Close => vec![],
                     } {
                         assert!(p.x.is_finite() && p.y.is_finite());

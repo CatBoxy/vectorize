@@ -1,7 +1,7 @@
 //! Colour tracer (PLAN.md M2): palette → per-pixel mix → regions →
 //! boundary graph → one fitted curve per boundary → one path per colour.
 
-use crate::bw::{corner_opts, TANGENT_WINDOW, VERTEX_BOX};
+use crate::bw::{corner_opts, polygon_opts, TANGENT_WINDOW};
 use crate::fit::FitOpts;
 use crate::graph::Graph;
 use crate::palette::{self, PaletteOpts};
@@ -10,7 +10,8 @@ use crate::{mix, regions, Fill, Params, Raster, Scene, Shape, StageClock};
 use crate::scene::Path;
 use std::collections::BTreeMap;
 
-/// Clusters closer than this in OKLab are one colour.
+/// Clusters closer than this in OKLab are one colour (the default of
+/// `Params::color_merge`).
 pub const MERGE_DIST: f32 = 0.04;
 /// A pixel with a 4-neighbour further than this in OKLab is an edge pixel.
 pub const EDGE_CONTRAST: f32 = 0.03;
@@ -31,7 +32,7 @@ pub fn trace_color(img: &Raster, params: &Params, clock: &mut StageClock) -> Sce
     let pal = palette::estimate(
         img,
         &an,
-        &PaletteOpts { max_colors: params.colors, merge_dist: MERGE_DIST, edge_contrast: EDGE_CONTRAST },
+        &PaletteOpts { max_colors: params.colors, merge_dist: params.color_merge.clamp(0.005, 0.3), edge_contrast: EDGE_CONTRAST },
     );
     clock.lap("palette");
     let mut mm = mix::unmix(&an, &pal);
@@ -54,7 +55,9 @@ pub fn trace_color(img: &Raster, params: &Params, clock: &mut StageClock) -> Sce
             }
         }
     }
-    let reg = regions::label(&mut mm, pal.background, params.min_area.max(1));
+    let reg = regions::label(&mut mm, pal.background, params.min_area.max(1), |a, b| {
+        pal.lab.get(a as usize).zip(pal.lab.get(b as usize)).map_or(0.0, |(x, y)| x.dist(*y))
+    });
     clock.lap("regions");
     let mut g = Graph::build(&reg);
     clock.lap("graph");
@@ -63,7 +66,10 @@ pub fn trace_color(img: &Raster, params: &Params, clock: &mut StageClock) -> Sce
         snap_lines: params.snap_lines,
         window: TANGENT_WINDOW,
     };
-    g.fit(&reg, &mm, params.tolerance.clamp(0.05, 4.0), VERTEX_BOX, &corner_opts(params), &o);
+    let accuracy = params.fit_accuracy.clamp(0.02, 4.0);
+    let ropts = crate::regularity::RegOpts::from_strength(params.regularity, accuracy);
+    let prim = crate::primitives::PrimOpts::new(accuracy);
+    g.fit(&reg, &mm, &polygon_opts(params), &corner_opts(params), &o, &ropts, params.primitives.then_some(&prim));
     clock.lap("fit");
     let faces = g.faces(&reg);
     let skip_bg = if params.ignore_background { pal.background } else { None };

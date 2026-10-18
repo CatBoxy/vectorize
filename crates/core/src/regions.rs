@@ -66,8 +66,10 @@ impl Uf {
 }
 
 /// Label the pixels of `mm`. `background` is the palette label of the
-/// background, if known; `min_area` the speckle threshold in pixels.
-pub fn label(mm: &mut MixMap, background: Option<u16>, min_area: u32) -> Regions {
+/// background, if known; `min_area` the speckle threshold in pixels;
+/// `color_dist(a, b)` the perceptual distance between two palette labels,
+/// used to break ties between neighbours a speckle borders equally.
+pub fn label(mm: &mut MixMap, background: Option<u16>, min_area: u32, color_dist: impl Fn(u16, u16) -> f32) -> Regions {
     let (w, h) = (mm.width, mm.height);
     let n = w * h;
     let mut lab: Vec<u16> = mm.mix.iter().map(|m| m.label()).collect();
@@ -169,16 +171,28 @@ pub fn label(mm: &mut MixMap, background: Option<u16>, min_area: u32) -> Regions
                 if merged_into[k as usize] != k || area[k as usize] >= min_area {
                     continue;
                 }
-                let mut best: Option<(u32, u32)> = None;
+                // Longest shared border wins; ties go to the nearest colour,
+                // then the lowest region id, so the result never depends on
+                // hash iteration order (which made one run in a thousand
+                // differ from the next and hang the bench on a rare chain).
+                let mut best: Option<(u32, u32, f32)> = None;
                 for (&(a, b), &len) in &border {
                     if a == k {
                         let b = resolve(&merged_into, b);
-                        if b != k && best.map_or(true, |(_, bl)| len > bl) {
-                            best = Some((b, len));
+                        if b == k {
+                            continue;
+                        }
+                        let d = color_dist(color[k as usize], color[b as usize]);
+                        let better = match best {
+                            None => true,
+                            Some((bb, bl, bd)) => len > bl || (len == bl && (d < bd || (d == bd && b < bb))),
+                        };
+                        if better {
+                            best = Some((b, len, d));
                         }
                     }
                 }
-                if let Some((target, _)) = best {
+                if let Some((target, _, _)) = best {
                     merged_into[k as usize] = target;
                     area[target as usize] += area[k as usize];
                     area[k as usize] = 0;
@@ -251,7 +265,7 @@ mod tests {
     #[test]
     fn components_and_speckles() {
         let mut mm = map(&["aaaaab", "aabaab", "aaaaab", "cccccb"]);
-        let r = label(&mut mm, Some(1), 2);
+        let r = label(&mut mm, Some(1), 2, |_, _| 0.0);
         // The single b inside a is a speckle: merged into a, recoloured.
         assert_eq!(r.get(2, 1), r.get(0, 0));
         assert_eq!(mm.mix[1 * 6 + 2], Mix::solid(1));
@@ -268,7 +282,7 @@ mod tests {
         // Diagonal line of b through a field of a: b is joined, so it is
         // one region and survives the speckle filter.
         let mut mm = map(&["baaa", "abaa", "aaba", "aaab"]);
-        let r = label(&mut mm, Some(1), 2);
+        let r = label(&mut mm, Some(1), 2, |_, _| 0.0);
         assert_eq!(r.get(0, 0), r.get(3, 3));
         assert_eq!(r.area[r.get(0, 0) as usize], 4);
         assert_eq!(r.joined_at(1, 1), Some(2));

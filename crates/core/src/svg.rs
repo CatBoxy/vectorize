@@ -56,6 +56,19 @@ fn push_path(s: &mut String, els: &[El]) {
                     fmt(end.y)
                 );
             }
+            El::EllipseTo { rx, ry, rot, large, sweep, end } => {
+                let _ = write!(
+                    s,
+                    "A{} {} {} {} {} {} {}",
+                    fmt(rx),
+                    fmt(ry),
+                    fmt(rot.to_degrees()),
+                    large as u8,
+                    sweep as u8,
+                    fmt(end.x),
+                    fmt(end.y)
+                );
+            }
             El::Close => s.push('Z'),
         }
     }

@@ -309,8 +309,11 @@ pub fn estimate(img: &Raster, an: &Analysis, o: &PaletteOpts) -> Palette {
         e.0 += 1;
         e.1 = e.1.add(an.lab[i]);
     }
-    let mut bins: Vec<(u32, Lab)> = hist.values().map(|&(c, s)| (c, s.scale(1.0 / c as f32))).collect();
-    bins.sort_by(|a, b| b.0.cmp(&a.0));
+    // Most populous first; equal counts in histogram-key order, so the seeds
+    // do not depend on hash iteration order.
+    let mut bins: Vec<(u32, Lab, u16)> = hist.iter().map(|(&k, &(c, s))| (c, s.scale(1.0 / c as f32), k)).collect();
+    bins.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(&b.2)));
+    let bins: Vec<(u32, Lab)> = bins.into_iter().map(|(c, l, _)| (c, l)).collect();
     let min_count = ((votes.len() as f32 * 0.0005) as u32).max(2);
     let max_k = o.max_colors.map(|m| m.max(1) as usize).unwrap_or(32).max(1);
     let mut seeds: Vec<Lab> = Vec::new();

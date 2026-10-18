@@ -13,13 +13,16 @@ pub enum Fill {
 }
 
 /// One path element. `ArcTo` is a circular arc of radius `r` from the
-/// current point to `end`, with SVG's large-arc and sweep flags.
+/// current point to `end`, with SVG's large-arc and sweep flags;
+/// `EllipseTo` an elliptical arc with radii `rx`, `ry` and the x axis
+/// rotated by `rot` radians (PLAN.md M4 ellipse primitive).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum El {
     MoveTo(Point),
     LineTo(Point),
     CurveTo(Point, Point, Point),
     ArcTo { r: f64, large: bool, sweep: bool, end: Point },
+    EllipseTo { rx: f64, ry: f64, rot: f64, large: bool, sweep: bool, end: Point },
     Close,
 }
 
@@ -27,7 +30,7 @@ impl El {
     /// Where the element ends; `None` for `Close`.
     pub fn end(&self) -> Option<Point> {
         match *self {
-            El::MoveTo(p) | El::LineTo(p) | El::CurveTo(_, _, p) | El::ArcTo { end: p, .. } => Some(p),
+            El::MoveTo(p) | El::LineTo(p) | El::CurveTo(_, _, p) | El::ArcTo { end: p, .. } | El::EllipseTo { end: p, .. } => Some(p),
             El::Close => None,
         }
     }
@@ -99,12 +102,17 @@ impl Path {
                     out.curve_to(a, b, p);
                     cur = p;
                 }
-                El::ArcTo { r, large, sweep, end } => {
+                El::ArcTo { .. } | El::EllipseTo { .. } => {
+                    let (rx, ry, rot, large, sweep, end) = match *el {
+                        El::EllipseTo { rx, ry, rot, large, sweep, end } => (rx, ry, rot, large, sweep, end),
+                        El::ArcTo { r, large, sweep, end } => (r, r, 0.0, large, sweep, end),
+                        _ => unreachable!(),
+                    };
                     let svg = kurbo::SvgArc {
                         from: cur,
                         to: end,
-                        radii: kurbo::Vec2::new(r, r),
-                        x_rotation: 0.0,
+                        radii: kurbo::Vec2::new(rx, ry),
+                        x_rotation: rot,
                         large_arc: large,
                         sweep,
                     };
@@ -177,6 +185,24 @@ impl Scene {
                 crate::svg::write(&one)
             })
             .collect()
+    }
+
+    /// Scale every coordinate (and arc radius) by `s`.
+    pub fn scale(&mut self, s: f64) {
+        for shape in &mut self.shapes {
+            for el in &mut shape.path.0 {
+                *el = match *el {
+                    El::MoveTo(p) => El::MoveTo((p.to_vec2() * s).to_point()),
+                    El::LineTo(p) => El::LineTo((p.to_vec2() * s).to_point()),
+                    El::CurveTo(a, b, p) => El::CurveTo((a.to_vec2() * s).to_point(), (b.to_vec2() * s).to_point(), (p.to_vec2() * s).to_point()),
+                    El::ArcTo { r, large, sweep, end } => El::ArcTo { r: r * s, large, sweep, end: (end.to_vec2() * s).to_point() },
+                    El::EllipseTo { rx, ry, rot, large, sweep, end } => {
+                        El::EllipseTo { rx: rx * s, ry: ry * s, rot, large, sweep, end: (end.to_vec2() * s).to_point() }
+                    }
+                    El::Close => El::Close,
+                };
+            }
+        }
     }
 
     pub fn distinct_colors(&self) -> usize {

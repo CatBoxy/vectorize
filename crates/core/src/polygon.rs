@@ -1,19 +1,306 @@
-//! Stage 5: polygon from a closed sub-pixel contour. Potrace's optimal
-//! polygon (Selinger 2003 §2.2, `trace.c`) generalised to real coordinates.
+//! Stage 5: polygon from a closed sub-pixel contour.
 //!
 //! 1. For each start point find how far a "straight" run extends: a run is
 //!    straight if some line passes within `tol` (L∞) of every point. Potrace's
 //!    incremental cone test is used with the box half-width scaled to `tol`.
 //!    A run that uses all four pixel step directions is never straight; that
 //!    rule is what keeps a 1 px line from collapsing onto its own axis.
-//! 2. Shortest cycle through straight runs, ties broken by the summed
-//!    least-squares deviation of the points from each segment (`penalty3`).
+//! 2. Shortest cycle through straight runs. Two costs are available
+//!    ([`PolygonCost`]):
+//!    - PolyFit (Dominici et al. 2020, the default, PLAN.md M4): every edge
+//!      costs one unit of *simplicity* plus an *accuracy* term (RMS distance
+//!      of its points from the segment, relative to `tol`), and every vertex a
+//!      *continuity* term (squared turning angle). The states of the shortest
+//!      path are edges, not vertices, so the turn between consecutive edges is
+//!      known; for a fixed total turn the squared penalty is smallest when the
+//!      turns are equal, which is PolyFit's curvature-variation cue without a
+//!      three-edge state. Candidate edges are the straight runs; an end point
+//!      that does not reach further than its start is skipped on straight
+//!      stretches, which keeps the state count linear on long edges.
+//!    - Potrace (Selinger 2003 §2.2, `trace.c`): fewest segments, ties broken
+//!      by the summed least-squares deviation (`penalty3`). Kept as the
+//!      fallback and for comparison.
 //! 3. Each polygon vertex moves to the point inside a `vbox` box around it
 //!    that is closest to the two neighbouring least-squares lines. That
 //!    intersection is where a chamfered corner actually was (Gong and
 //!    Newman 2018 recover corners the same way).
 
 use kurbo::{Point, Vec2};
+
+/// Which polygon cost the shortest cycle minimises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolygonCost {
+    /// Simplicity + accuracy + continuity (PolyFit).
+    Polyfit,
+    /// Fewest segments, then least deviation (Potrace).
+    Potrace,
+}
+
+/// Options of the polygon stage.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PolygonOpts {
+    /// Straightness tolerance in px (Potrace: 0.5 on pixel corners).
+    pub tol: f64,
+    /// Half-width of the vertex adjustment box, px.
+    pub vbox: f64,
+    pub cost: PolygonCost,
+    /// Weight of the accuracy term (RMS deviation / `tol`) per edge.
+    pub w_accuracy: f64,
+    /// Weight of the continuity term (turning angle², radians) per vertex.
+    pub w_continuity: f64,
+}
+
+impl PolygonOpts {
+    pub fn new(tol: f64, vbox: f64) -> Self {
+        // `VECTORIZE_POLY_W=acc,cont` overrides the weights for experiments.
+        let (w_accuracy, w_continuity) = std::env::var("VECTORIZE_POLY_W")
+            .ok()
+            .and_then(|v| {
+                let (a, c) = v.split_once(',')?;
+                Some((a.trim().parse().ok()?, c.trim().parse().ok()?))
+            })
+            .unwrap_or((W_ACCURACY, W_CONTINUITY));
+        Self { tol, vbox, cost: PolygonCost::Polyfit, w_accuracy, w_continuity }
+    }
+    pub fn potrace(tol: f64, vbox: f64) -> Self {
+        Self { cost: PolygonCost::Potrace, ..Self::new(tol, vbox) }
+    }
+}
+
+/// Default accuracy weight: an edge whose points scatter by the whole
+/// tolerance costs half an extra edge.
+pub const W_ACCURACY: f64 = 0.5;
+/// Default continuity weight (PolyFit's curvature-variation weight): a 90°
+/// turn costs 0.62 of an edge, so a real corner is never split in two, but
+/// among polygons with the same edge count the one turning evenly wins.
+pub const W_CONTINUITY: f64 = 0.25;
+/// Most edge-to-edge transitions the PolyFit search may examine for one
+/// contour before falling back to the Potrace cost.
+pub const POLYFIT_BUDGET: usize = 6_000_000;
+
+/// Polygon for a closed contour with the chosen cost; see [`polygonize`].
+pub fn polygonize_with(pts: &[Point], dirs: &[u8], o: &PolygonOpts) -> (Vec<Point>, Vec<usize>) {
+    let n = pts.len();
+    if n < 3 || dirs.len() != n {
+        return (pts.to_vec(), (0..n).collect());
+    }
+    let sums = calc_sums(pts);
+    let lon = calc_lon(pts, dirs, 2.0 * o.tol);
+    let mut po = match o.cost {
+        PolygonCost::Potrace => best_polygon(pts, &sums, &lon),
+        PolygonCost::Polyfit => polyfit_cycle(pts, &sums, &lon, o).unwrap_or_else(|| best_polygon(pts, &sums, &lon)),
+    };
+    let big = merge_cut_corners(&mut po, pts, &sums, MERGE_CHORD, MERGE_NEAR);
+    let verts = adjust_vertices(pts, &sums, &po, o.vbox, &big);
+    (verts, po)
+}
+
+/// Polygon for an open chain with the chosen cost; see [`polygonize_open`].
+pub fn polygonize_open_with(pts: &[Point], dirs: &[u8], o: &PolygonOpts) -> (Vec<Point>, Vec<usize>) {
+    let n = pts.len();
+    if n < 3 || dirs.len() != n {
+        return (pts.to_vec(), (0..n).collect());
+    }
+    let sums = calc_sums(pts);
+    let lon = calc_lon_open(pts, dirs, 2.0 * o.tol);
+    let mut po = match o.cost {
+        PolygonCost::Potrace => best_polygon_open(pts, &sums, &lon),
+        PolygonCost::Polyfit => polyfit_path(pts, &sums, &lon, o).unwrap_or_else(|| best_polygon_open(pts, &sums, &lon)),
+    };
+    let big = merge_cut_corners_open(&mut po, pts, &sums, MERGE_CHORD, MERGE_NEAR);
+    let verts = adjust_vertices_open(pts, &sums, &po, o.vbox, &big);
+    (verts, po)
+}
+
+/// RMS distance of points `i..=j` from the segment between them (`j` may
+/// exceed `n` to wrap), relative to `tol`.
+fn accuracy_cost(pts: &[Point], sums: &[Sum], i: usize, j: usize, tol: f64) -> f64 {
+    let n = pts.len();
+    let jj = if j >= n { j - n } else { j };
+    let len = (pts[jj] - pts[i]).hypot();
+    if len < 1e-9 {
+        return 0.0;
+    }
+    penalty3(pts, sums, i, j) / len / tol.max(1e-6)
+}
+
+/// Turning angle at `b` between `a → b` and `b → c`, radians in `0..=π`.
+#[inline]
+fn turn_angle(a: Point, b: Point, c: Point) -> f64 {
+    let (u, v) = (b - a, c - b);
+    u.cross(v).atan2(u.dot(v)).abs()
+}
+
+/// Candidate ends of an edge starting at `i`, as unrolled indices in
+/// `i+1 ..= i+reach`, where `reach(k)` is how far the straight run from `k`
+/// extends. The last point of the run and the next point are always
+/// candidates; an interior point is one only when the run starting there
+/// reaches further than the run from `i` (otherwise it adds a vertex
+/// without extending the polygon; on a long straight edge that leaves one
+/// candidate) and lies within [`CANDIDATE_WINDOW`] of the run's end: the
+/// simplicity term keeps edges long, so shorter edges only ever serve to
+/// even out the turns, and a few points of slack suffice for that.
+fn candidates(i: usize, reach: &dyn Fn(usize) -> usize, limit: usize) -> Vec<usize> {
+    let r = reach(i).max(1);
+    let far = (i + r).min(limit);
+    let mut out = Vec::new();
+    let lo = (i + 1).max(far.saturating_sub(CANDIDATE_WINDOW));
+    for j in lo..far {
+        if j + reach(j) > far {
+            out.push(j);
+        }
+    }
+    if far > i {
+        out.push(far);
+    }
+    if out.first() != Some(&(i + 1)) && i + 1 <= limit {
+        out.insert(0, i + 1);
+    }
+    out.dedup();
+    out
+}
+
+/// How many points before the end of a straight run may end an edge.
+pub const CANDIDATE_WINDOW: usize = 8;
+
+/// Shortest path over edge states from vertex 0 to vertex `limit` (unrolled
+/// index; `limit == n` closes a cycle). `first` restricts the first edge;
+/// `closing` adds the turn at the start vertex for a cycle. Returns the
+/// vertex indices (unrolled) and the total cost, or `None` when the search
+/// would exceed the budget.
+fn polyfit_search(
+    pts: &[Point],
+    sums: &[Sum],
+    cand: &[Vec<usize>],
+    o: &PolygonOpts,
+    limit: usize,
+    first: Option<usize>,
+    closing: bool,
+) -> Option<(Vec<usize>, f64)> {
+    let n = pts.len();
+    let p = |k: usize| pts[k % n];
+    // Edges ending at each vertex.
+    let mut rev: Vec<Vec<usize>> = vec![Vec::new(); limit + 1];
+    for (i, cs) in cand.iter().enumerate().take(limit) {
+        for &j in cs {
+            if j <= limit {
+                rev[j].push(i);
+            }
+        }
+    }
+    // One state per edge `(i, j)`, stored with the vertex `j` it ends at:
+    // `(i, cost, slot)`, where `slot` indexes `all`, the flat list of states
+    // used for predecessor links.
+    struct St {
+        from: usize,
+        pred: usize,
+    }
+    let mut all: Vec<St> = Vec::new();
+    let mut states: Vec<Vec<(usize, f64, usize)>> = vec![Vec::new(); limit + 1];
+    let mut work = 0usize;
+    for j in 1..=limit {
+        for &i in &rev[j] {
+            let edge = 1.0 + o.w_accuracy * accuracy_cost(pts, sums, i, j, o.tol);
+            if i == 0 {
+                if first.map_or(true, |f| f == j) {
+                    all.push(St { from: 0, pred: usize::MAX });
+                    states[j].push((0, edge, all.len() - 1));
+                }
+                continue;
+            }
+            if states[i].is_empty() {
+                continue;
+            }
+            work += states[i].len();
+            if work > POLYFIT_BUDGET {
+                return None;
+            }
+            let mut best: Option<(f64, usize)> = None;
+            for &(k, c, slot) in &states[i] {
+                let t = turn_angle(p(k), p(i), p(j));
+                let cost = c + edge + o.w_continuity * t * t;
+                if best.map_or(true, |(bc, _)| cost < bc) {
+                    best = Some((cost, slot));
+                }
+            }
+            if let Some((cost, pred)) = best {
+                all.push(St { from: i, pred });
+                states[j].push((i, cost, all.len() - 1));
+            }
+        }
+    }
+    // Best final state, with the closing turn when it is a cycle.
+    let first_vertex = |slot: usize| -> usize {
+        // The first edge of the path through `slot` ends at the vertex whose
+        // state has no predecessor; walk back to it.
+        let mut s = slot;
+        let mut to = limit;
+        loop {
+            let st = &all[s];
+            if st.pred == usize::MAX {
+                return to;
+            }
+            to = st.from;
+            s = st.pred;
+        }
+    };
+    let mut best: Option<(f64, usize)> = None;
+    for &(k, c, slot) in &states[limit] {
+        let mut cost = c;
+        if closing {
+            let j0 = first_vertex(slot);
+            let t = turn_angle(p(k), p(0), p(j0));
+            cost += o.w_continuity * t * t;
+        }
+        if best.map_or(true, |(bc, _)| cost < bc) {
+            best = Some((cost, slot));
+        }
+    }
+    let (cost, mut slot) = best?;
+    let mut path = vec![limit];
+    loop {
+        let st = &all[slot];
+        path.push(st.from);
+        if st.pred == usize::MAX {
+            break;
+        }
+        slot = st.pred;
+    }
+    path.reverse();
+    Some((path, cost))
+}
+
+/// PolyFit-cost polygon of a closed contour: vertex indices starting at 0.
+fn polyfit_cycle(pts: &[Point], sums: &[Sum], lon: &[usize], o: &PolygonOpts) -> Option<Vec<usize>> {
+    let n = pts.len();
+    let reach = |k: usize| -> usize {
+        let k = k % n;
+        let r = (lon[k] + n - k) % n;
+        r.max(1)
+    };
+    let cand: Vec<Vec<usize>> = (0..n).map(|i| candidates(i, &reach, n)).collect();
+    // The turn at vertex 0 between the last and the first edge is not
+    // scored: vertex 0 is a real corner of the contour whenever there is
+    // one, so that turn is the same for every candidate cycle to within
+    // noise, and scoring it exactly would need a second pass per first edge.
+    let (path, _) = polyfit_search(pts, sums, &cand, o, n, None, false)?;
+    let mut po: Vec<usize> = path.iter().copied().filter(|&v| v < n).collect();
+    po.dedup();
+    if po.len() < 3 {
+        return None;
+    }
+    Some(po)
+}
+
+/// PolyFit-cost polygon of an open chain from point 0 to point `n - 1`.
+fn polyfit_path(pts: &[Point], sums: &[Sum], lon: &[usize], o: &PolygonOpts) -> Option<Vec<usize>> {
+    let n = pts.len();
+    let reach = |k: usize| -> usize { lon[k.min(n - 1)].saturating_sub(k).max(1) };
+    let cand: Vec<Vec<usize>> = (0..n - 1).map(|i| candidates(i, &reach, n - 1)).collect();
+    let (path, _) = polyfit_search(pts, sums, &cand, o, n - 1, None, false)?;
+    Some(path)
+}
 
 #[derive(Clone, Copy, Default, Debug)]
 struct Sum {
@@ -36,8 +323,8 @@ pub fn polygonize(pts: &[Point], dirs: &[u8], tol: f64, vbox: f64) -> (Vec<Point
     let sums = calc_sums(pts);
     let lon = calc_lon(pts, dirs, 2.0 * tol);
     let mut po = best_polygon(pts, &sums, &lon);
-    merge_cut_corners(&mut po, pts, &sums, MERGE_CHORD, MERGE_NEAR);
-    let verts = adjust_vertices(pts, &sums, &po, vbox);
+    let big = merge_cut_corners(&mut po, pts, &sums, MERGE_CHORD, MERGE_NEAR);
+    let verts = adjust_vertices(pts, &sums, &po, vbox, &big);
     (verts, po)
 }
 
@@ -52,8 +339,8 @@ pub fn polygonize_open(pts: &[Point], dirs: &[u8], tol: f64, vbox: f64) -> (Vec<
     let sums = calc_sums(pts);
     let lon = calc_lon_open(pts, dirs, 2.0 * tol);
     let mut po = best_polygon_open(pts, &sums, &lon);
-    merge_cut_corners_open(&mut po, pts, &sums, MERGE_CHORD, MERGE_NEAR);
-    let verts = adjust_vertices_open(pts, &sums, &po, vbox);
+    let big = merge_cut_corners_open(&mut po, pts, &sums, MERGE_CHORD, MERGE_NEAR);
+    let verts = adjust_vertices_open(pts, &sums, &po, vbox, &big);
     (verts, po)
 }
 
@@ -128,13 +415,14 @@ fn best_polygon_open(pts: &[Point], sums: &[Sum], lon: &[usize]) -> Vec<usize> {
 }
 
 /// `merge_cut_corners` for an open polygon: never touches the end vertices.
-fn merge_cut_corners_open(po: &mut Vec<usize>, pts: &[Point], sums: &[Sum], max_chord: f64, near: f64) {
+fn merge_cut_corners_open(po: &mut Vec<usize>, pts: &[Point], sums: &[Sum], max_chord: f64, near: f64) -> Vec<bool> {
     let n = pts.len();
     let origin = pts[0];
+    let mut big = vec![false; po.len()];
     loop {
         let m = po.len();
         if m <= 3 {
-            return;
+            return big;
         }
         let mut merged = false;
         for i in 1..m - 2 {
@@ -152,20 +440,24 @@ fn merge_cut_corners_open(po: &mut Vec<usize>, pts: &[Point], sums: &[Sum], max_
             let t = (cb - ca).cross(db) / det;
             let x = origin + ca + da * t;
             let mid = pts[a].midpoint(pts[b]);
-            if (x - mid).hypot() <= near {
+            let flat = (pts[b] - pts[a]).hypot() >= MERGE_FLAT_MIN && b - a >= 3 && (a + 1..b).all(|k| on_chord(pts[a], pts[b], pts[k], MERGE_FLAT));
+            let limit = if flat { near } else { near.max(MERGE_NEAR_TIP) };
+            if (x - mid).hypot() <= limit {
                 po.remove(i + 1);
+                big.remove(i + 1);
+                big[i] = true;
                 merged = true;
                 break;
             }
         }
         if !merged {
-            return;
+            return big;
         }
     }
 }
 
 /// `adjust_vertices` for an open polygon: the ends stay where they are.
-fn adjust_vertices_open(pts: &[Point], sums: &[Sum], po: &[usize], vbox: f64) -> Vec<Point> {
+fn adjust_vertices_open(pts: &[Point], sums: &[Sum], po: &[usize], vbox: f64, big: &[bool]) -> Vec<Point> {
     let m = po.len();
     let n = pts.len();
     let origin = pts[0];
@@ -195,7 +487,8 @@ fn adjust_vertices_open(pts: &[Point], sums: &[Sum], po: &[usize], vbox: f64) ->
                 qq[l][k] = q[i - 1][l][k] + q[i][l][k];
             }
         }
-        out.push(origin + minimise_in_box(&mut qq, s, vbox));
+        let box_i = if big.get(i).copied().unwrap_or(false) { vbox.max(TIP_BOX) } else { vbox };
+        out.push(origin + minimise_in_box(&mut qq, s, box_i));
     }
     if m > 1 {
         out.push(pts[po[m - 1]]);
@@ -215,18 +508,25 @@ pub const MERGE_NEAR: f64 = 1.5;
 /// of the two edges around such a short edge meet near it, drop its second
 /// vertex; adjustment then moves the first to that intersection. The flat
 /// end of a narrow bar is a short edge too, but its neighbours are parallel
-/// and stay.
-fn merge_cut_corners(po: &mut Vec<usize>, pts: &[Point], sums: &[Sum], max_chord: f64, near: f64) {
+/// and stay. A sharp tip loses more than one pixel to anti-aliasing and its
+/// apex lies further out, so when no measured point sits between the two
+/// vertices, or only stair points off its chord, the lines may meet up to
+/// [`MERGE_NEAR_TIP`] away, unless the points between the two vertices all
+/// lie on the short edge, which makes it a real flat. Returns, per
+/// surviving vertex, whether it
+/// absorbed a merge and so may be moved further during adjustment.
+fn merge_cut_corners(po: &mut Vec<usize>, pts: &[Point], sums: &[Sum], max_chord: f64, near: f64) -> Vec<bool> {
     let n = pts.len();
     let origin = pts[0];
     let line = |i: usize, j: usize| -> (Vec2, Vec2) {
         let j = (j + n - i) % n + i;
         pointslope(sums, n, i, j)
     };
+    let mut big = vec![false; po.len()];
     loop {
         let m = po.len();
         if m <= 3 {
-            return;
+            return big;
         }
         let mut merged = false;
         for i in 0..m {
@@ -244,17 +544,54 @@ fn merge_cut_corners(po: &mut Vec<usize>, pts: &[Point], sums: &[Sum], max_chord
             let t = (cb - ca).cross(db) / det;
             let x = origin + ca + da * t;
             let mid = pts[a].midpoint(pts[b]);
-            if (x - mid).hypot() <= near {
+            // With two or more measured points between the vertices the
+            // short edge may be a real flat; with fewer there is no evidence
+            // of one and a sharp tip is the likelier reading.
+            let between = (b + n - a) % n;
+            let chord = (pts[b] - pts[a]).hypot();
+            let flat = chord >= MERGE_FLAT_MIN && between >= 3 && (1..between).all(|s| on_chord(pts[a], pts[b], pts[(a + s) % n], MERGE_FLAT));
+            let limit = if flat { near } else { near.max(MERGE_NEAR_TIP) };
+            if std::env::var("VECTORIZE_DEBUG").as_deref() == Ok("merge") {
+                eprintln!(
+                    "merge? a ({:.2},{:.2}) b ({:.2},{:.2}) chord {:.2} between {} x ({:.2},{:.2}) dist {:.2} limit {:.2}",
+                    pts[a].x, pts[a].y, pts[b].x, pts[b].y, (pts[b] - pts[a]).hypot(), between, x.x, x.y, (x - mid).hypot(), limit
+                );
+            }
+            if (x - mid).hypot() <= limit {
                 po.remove((i + 1) % m);
+                big.remove((i + 1) % m);
+                let keep = if (i + 1) % m == 0 { i - 1 } else { i };
+                big[keep] = true;
                 merged = true;
                 break;
             }
         }
         if !merged {
-            return;
+            return big;
         }
     }
 }
+
+/// A sharp tip's apex may lie this far from the short edge that cuts it, px.
+pub const MERGE_NEAR_TIP: f64 = 4.0;
+/// Points between the two vertices of a short edge that all lie within this
+/// of its chord make it a real flat rather than a cut corner, px...
+pub const MERGE_FLAT: f64 = 0.35;
+/// ... provided the edge is at least this long; shorter, it is below the
+/// resolution at which a flat can be told from the stairs of a tip.
+pub const MERGE_FLAT_MIN: f64 = 1.5;
+
+/// Is `p` within `tol` of the segment `a → b`?
+fn on_chord(a: Point, b: Point, p: Point, tol: f64) -> bool {
+    let d = b - a;
+    let len = d.hypot();
+    if len < 1e-9 {
+        return (p - a).hypot() <= tol;
+    }
+    ((p - a).cross(d) / len).abs() <= tol
+}
+/// How far a vertex that absorbed a cut corner may move during adjustment.
+pub const TIP_BOX: f64 = 4.0;
 
 /// Prefix sums relative to `pts[0]`, `n + 1` entries.
 fn calc_sums(pts: &[Point]) -> Vec<Sum> {
@@ -498,8 +835,9 @@ fn quadform(q: &Quad, w: Vec2) -> f64 {
     s
 }
 
-/// Potrace's `adjust_vertices` with a configurable box.
-fn adjust_vertices(pts: &[Point], sums: &[Sum], po: &[usize], vbox: f64) -> Vec<Point> {
+/// Potrace's `adjust_vertices` with a configurable box; vertices flagged in
+/// `big` (merged cut corners, whose apex lies further out) get [`TIP_BOX`].
+fn adjust_vertices(pts: &[Point], sums: &[Sum], po: &[usize], vbox: f64, big: &[bool]) -> Vec<Point> {
     let m = po.len();
     let n = pts.len();
     if m == 0 {
@@ -531,7 +869,8 @@ fn adjust_vertices(pts: &[Point], sums: &[Sum], po: &[usize], vbox: f64) -> Vec<
                 qq[l][k] = q[j][l][k] + q[i][l][k];
             }
         }
-        out.push(origin + minimise_in_box(&mut qq, s, vbox));
+        let box_i = if big.get(i).copied().unwrap_or(false) { vbox.max(TIP_BOX) } else { vbox };
+        out.push(origin + minimise_in_box(&mut qq, s, box_i));
     }
     out
 }
@@ -667,6 +1006,97 @@ mod tests {
         let (pts, dirs) = rect_contour(20, 1);
         let (v, _) = polygonize(&pts, &dirs, 0.2, 0.5);
         assert_eq!(v.len(), 4, "{v:?}");
+    }
+
+    #[test]
+    fn polyfit_cost_keeps_rectangle_and_thin_line() {
+        let (pts, dirs) = rect_contour(12, 7);
+        let (v, _) = polygonize_with(&pts, &dirs, &PolygonOpts::new(0.5, 0.5));
+        assert_eq!(v.len(), 4, "{v:?}");
+        let (pts, dirs) = rect_contour(20, 1);
+        let (v, _) = polygonize_with(&pts, &dirs, &PolygonOpts::new(0.2, 0.5));
+        assert_eq!(v.len(), 4, "{v:?}");
+        // A long straight edge has one candidate end per start point, so the
+        // search stays cheap: a 400 px square must be four vertices too.
+        let (pts, dirs) = rect_contour(400, 400);
+        let (v, _) = polygonize_with(&pts, &dirs, &PolygonOpts::new(0.2, 0.5));
+        assert_eq!(v.len(), 4, "{v:?}");
+    }
+
+    #[test]
+    fn polyfit_cost_turns_evenly_on_a_circle() {
+        let r = 30.0;
+        let n = 240;
+        let pts: Vec<Point> = (0..n)
+            .map(|i| {
+                let t = i as f64 / n as f64 * std::f64::consts::TAU;
+                Point::new(50.0 + r * t.cos(), 50.0 + r * t.sin())
+            })
+            .collect();
+        let dirs: Vec<u8> = (0..n)
+            .map(|i| {
+                let t = i as f64 / n as f64 * std::f64::consts::TAU;
+                let (dx, dy) = (-t.sin(), t.cos());
+                if dx.abs() > dy.abs() { if dx > 0.0 { 0 } else { 2 } } else if dy > 0.0 { 1 } else { 3 }
+            })
+            .collect();
+        let (v, _) = polygonize_with(&pts, &dirs, &PolygonOpts::new(0.5, 0.5));
+        let (vp, _) = polygonize_with(&pts, &dirs, &PolygonOpts::potrace(0.5, 0.5));
+        assert!(v.len() >= 8 && v.len() <= vp.len() + 2, "{} vs potrace {}", v.len(), vp.len());
+        // Turning angles vary less than with the Potrace cost.
+        let spread = |v: &[Point]| {
+            let m = v.len();
+            let turns: Vec<f64> = (0..m).map(|i| turn_angle(v[(i + m - 1) % m], v[i], v[(i + 1) % m])).collect();
+            let mean = turns.iter().sum::<f64>() / m as f64;
+            (turns.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / m as f64).sqrt()
+        };
+        assert!(spread(&v) <= spread(&vp) + 1e-9, "{} vs {}", spread(&v), spread(&vp));
+        for p in &v {
+            let d = ((p.x - 50.0).powi(2) + (p.y - 50.0).powi(2)).sqrt();
+            assert!((d - r).abs() < 1.0, "vertex off the circle by {}", d - r);
+        }
+    }
+
+    #[test]
+    fn sharp_tip_cut_corner_is_merged_and_recovered() {
+        // A 36° tip pointing up: two edges meeting at (50, 0), whose apex
+        // the raster lost. The contour has the edges' points and, across
+        // the tip, two stair points 1.3 px apart with one more between.
+        let half = 18f64.to_radians();
+        let left = |t: f64| Point::new(50.0 - t * half.sin(), t * half.cos());
+        let right = |t: f64| Point::new(50.0 + t * half.sin(), t * half.cos());
+        let mut pts = Vec::new();
+        let mut dirs = Vec::new();
+        // Up the left edge from far away to the cut, across, down the right.
+        for k in (3..60).rev() {
+            pts.push(left(k as f64));
+            dirs.push(3u8);
+        }
+        pts.push(left(2.0));
+        dirs.push(3);
+        pts.push(Point::new(50.0, 1.5));
+        dirs.push(0);
+        pts.push(right(2.0));
+        dirs.push(1);
+        for k in 3..60 {
+            pts.push(right(k as f64));
+            dirs.push(1u8);
+        }
+        // Close along the bottom.
+        let n_side = pts.len();
+        let b = pts[n_side - 1];
+        let a = pts[0];
+        let steps = 20;
+        for k in 1..steps {
+            pts.push(b.lerp(a, k as f64 / steps as f64));
+            dirs.push(2u8);
+        }
+        let (v, _) = polygonize_with(&pts, &dirs, &PolygonOpts::new(0.2, 1.5));
+        // Four vertices: the apex, the two bottom corners... and the apex
+        // must sit near (50, 0), recovered from the two edge lines.
+        let apex = v.iter().copied().min_by(|p, q| p.y.partial_cmp(&q.y).unwrap()).unwrap();
+        assert!((apex - Point::new(50.0, 0.0)).hypot() < 0.3, "apex {apex:?} in {v:?}");
+        assert!(v.len() <= 4, "{v:?}");
     }
 
     #[test]

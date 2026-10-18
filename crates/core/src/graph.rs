@@ -11,7 +11,9 @@
 
 use crate::chain::{self, Chain};
 use crate::decompose::DIRS;
-use crate::fit::{self, FitOpts, CORNER_CLEAR};
+use crate::fit::{self, FitOpts};
+use crate::primitives;
+use crate::regularity;
 use crate::mix::MixMap;
 use crate::polygon;
 use crate::regions::{Regions, OUTSIDE};
@@ -303,7 +305,16 @@ impl Graph {
     }
 
     /// Refine, polygonise and fit every edge.
-    pub fn fit(&mut self, reg: &Regions, mm: &MixMap, tol: f64, vbox: f64, copts: &fit::CornerOpts, o: &FitOpts) {
+    pub fn fit(
+        &mut self,
+        reg: &Regions,
+        mm: &MixMap,
+        popts: &polygon::PolygonOpts,
+        copts: &fit::CornerOpts,
+        o: &FitOpts,
+        ropts: &regularity::RegOpts,
+        prim: Option<&primitives::PrimOpts>,
+    ) {
         let mut chains = self.refine_chains(reg, mm);
         self.refine_junctions(&chains);
         let ghosts = self.pair_continuations(&chains);
@@ -327,7 +338,19 @@ impl Graph {
                 );
             }
         }
-        for (ei, (e, c)) in self.edges.iter_mut().zip(chains.iter_mut()).enumerate() {
+        // Plan every edge first: its anchors (corner vertices and junction
+        // ends, the latter shared by every chain meeting there) and the runs
+        // between them. The regulariser then moves anchors of all chains
+        // together (PLAN.md M4), and only then is anything fitted.
+        enum Plan {
+            Fixed { start: Point, end: Point, els: Vec<El> },
+            Runs { ids: Vec<usize>, runs: Vec<fit::Run>, closed: bool },
+        }
+        let mut rg = regularity::Reg::default();
+        let mut junction_ids: HashMap<(i32, i32), usize> = HashMap::new();
+        let mut plans: Vec<Plan> = Vec::with_capacity(self.edges.len());
+        let dbg_prims = std::env::var("VECTORIZE_DEBUG").as_deref() == Ok("prims");
+        for (e, c) in self.edges.iter().zip(chains.iter_mut()) {
             if !e.closed {
                 if let Some(p) = self.junctions.get(&e.corners[0]) {
                     c.pts[0] = *p;
@@ -340,90 +363,174 @@ impl Graph {
             let pts: Vec<Point> = idx.iter().map(|&k| c.pts[k]).collect();
             let dirs: Vec<u8> = idx.iter().map(|&k| c.dirs[k]).collect();
             if e.closed {
-                let (verts, po) = polygon::polygonize(&pts, &dirs, tol, vbox);
+                let (verts, po) = polygon::polygonize_with(&pts, &dirs, popts);
                 let po: Vec<usize> = po.into_iter().map(|j| idx[j]).collect();
-                let mut path = Path::new();
-                if verts.len() >= 3 {
-                    let corner = fit::classify_corners(&c.pts, &c.fit_ok, &verts, &po, true, copts);
-                    let contour = crate::contour::Contour {
-                        pts: c.pts.clone(),
-                        dirs: c.dirs.clone(),
-                        is_corner: c.is_corner.clone(),
-                        fit_ok: c.fit_ok.clone(),
-                        area: 0.0,
+                let n = c.pts.len();
+                if verts.len() < 3 || pts.len() < 3 {
+                    plans.push(Plan::Fixed { start: c.pts[0], end: c.pts[0], els: Vec::new() });
+                    continue;
+                }
+                let corner = fit::classify_corners(&c.pts, &c.fit_ok, &verts, &po, true, copts);
+                let corners: Vec<usize> = (0..verts.len()).filter(|&i| corner[i]).collect();
+                let first = po[0] % n;
+                let samples: Vec<Point> = (0..n).map(|k| (first + k) % n).filter(|&k| c.fit_ok[k]).map(|k| c.pts[k]).collect();
+                // A whole primitive (M4); on a smooth loop it must not cost
+                // nodes against the ordinary fit.
+                let primitive = prim.and_then(|po| {
+                    let cpts: Vec<Point> = corners.iter().map(|&i| verts[i]).collect();
+                    primitives::propose(&samples, &cpts, po)
+                });
+                if corners.is_empty() {
+                    let (start, els) = fit::fit_run(&samples, true, o);
+                    let (start, mut els) = match primitive {
+                        Some((p, ps, pels)) if pels.len() <= els.len() => {
+                            if dbg_prims {
+                                eprintln!("edge primitive: {p:?} ({} vs {} fitted)", pels.len(), els.len());
+                            }
+                            (ps, pels)
+                        }
+                        _ => (start, els),
                     };
-                    fit::append_loop(&mut path, &contour, &verts, &po, &corner, o);
-                }
-                let (start, mut els) = split_path(&path);
-                if let Some(s) = start {
-                    if els.last().map_or(true, |l| (end_of(l) - s).hypot() > 1e-9) {
-                        els.push(El::LineTo(s));
+                    if els.last().map_or(true, |l| (end_of(l) - start).hypot() > 1e-9) {
+                        els.push(El::LineTo(start));
                     }
-                    e.start = s;
-                    e.end = s;
-                } else {
-                    e.start = c.pts[0];
-                    e.end = c.pts[0];
+                    plans.push(Plan::Fixed { start, end: start, els });
+                    continue;
                 }
-                e.els = els;
+                if let Some((p, start, mut els)) = primitive {
+                    if dbg_prims {
+                        eprintln!("edge primitive: {p:?}");
+                    }
+                    if els.last().map_or(true, |l| (end_of(l) - start).hypot() > 1e-9) {
+                        els.push(El::LineTo(start));
+                    }
+                    plans.push(Plan::Fixed { start, end: start, els });
+                    continue;
+                }
+                let ids: Vec<usize> = corners.iter().map(|&i| rg.add_anchor(verts[i], false)).collect();
+                let vl = verts.len();
+                let clear: Vec<f64> = corners.iter().map(|&i| fit::corner_clear(fit::turn_at(verts[(i + vl - 1) % vl], verts[i], verts[(i + 1) % vl]))).collect();
+                let mut runs = Vec::with_capacity(corners.len());
+                for (ci, &a) in corners.iter().enumerate() {
+                    let cj = (ci + 1) % corners.len();
+                    let b = corners[cj];
+                    let (va, vb) = (verts[a], verts[b]);
+                    let smp = fit::run_samples(&c.pts, &c.fit_ok, po[a] % n, po[b] % n, true, va, vb, clear[ci], clear[cj]);
+                    let run = fit::plan_run(smp, va, vb, o);
+                    let (ia, ib) = (ids[ci], ids[(ci + 1) % ids.len()]);
+                    if run.line {
+                        rg.add_line(ia, ib, run.samples.clone());
+                    } else if let Some((ta, tb)) = fit::run_end_tangents(&run, va, vb) {
+                        rg.add_curve_end(ia, ta);
+                        rg.add_curve_end(ib, tb);
+                    }
+                    runs.push(run);
+                }
+                plans.push(Plan::Runs { ids, runs, closed: true });
             } else {
-                let (verts, po) = polygon::polygonize_open(&pts, &dirs, tol, vbox);
+                let (verts, po) = polygon::polygonize_open_with(&pts, &dirs, popts);
                 let po: Vec<usize> = po.into_iter().map(|j| idx[j]).collect();
                 let m = verts.len();
-                e.start = c.pts[0];
-                e.end = *c.pts.last().unwrap();
-                e.els.clear();
+                let (start, end) = (c.pts[0], *c.pts.last().unwrap());
                 if m < 2 {
-                    e.els.push(El::LineTo(e.end));
+                    plans.push(Plan::Fixed { start, end, els: vec![El::LineTo(end)] });
                     continue;
                 }
                 let corner = fit::classify_corners(&c.pts, &c.fit_ok, &verts, &po, false, copts);
                 let cs: Vec<usize> = (0..m).filter(|&i| corner[i]).collect();
-                if std::env::var("VECTORIZE_DEBUG").as_deref() == Ok("chains") {
-                    eprintln!(
-                        "  open edge: {} pts, polygon {} verts, {} corners at {:?}",
-                        pts.len(),
-                        m,
-                        cs.len(),
-                        cs.iter().map(|&i| format!("({:.1},{:.1})", verts[i].x, verts[i].y)).collect::<Vec<_>>()
-                    );
+                let mut ids = Vec::with_capacity(cs.len());
+                for (k, &i) in cs.iter().enumerate() {
+                    let id = if k == 0 {
+                        *junction_ids.entry(e.corners[0]).or_insert_with(|| rg.add_anchor(start, true))
+                    } else if k == cs.len() - 1 {
+                        *junction_ids.entry(*e.corners.last().unwrap()).or_insert_with(|| rg.add_anchor(end, true))
+                    } else {
+                        rg.add_anchor(verts[i], false)
+                    };
+                    ids.push(id);
                 }
-                for w in cs.windows(2) {
+                // Interior corners get the angle-dependent clearance; the
+                // junction ends keep the default (their angle is not a
+                // property of this chain alone).
+                let clear: Vec<f64> = cs
+                    .iter()
+                    .map(|&i| if i == 0 || i + 1 == m { fit::CORNER_CLEAR } else { fit::corner_clear(fit::turn_at(verts[i - 1], verts[i], verts[i + 1])) })
+                    .collect();
+                let mut runs = Vec::with_capacity(cs.len());
+                for (k, w) in cs.windows(2).enumerate() {
                     let (a, b) = (w[0], w[1]);
                     let (va, vb) = (verts[a], verts[b]);
-                    let mut samples = vec![va];
-                    for k in po[a] + 1..po[b] {
-                        let p = c.pts[k];
-                        if c.fit_ok[k] && (p - va).hypot() > CORNER_CLEAR && (p - vb).hypot() > CORNER_CLEAR {
-                            samples.push(p);
+                    let smp = fit::run_samples(&c.pts, &c.fit_ok, po[a], po[b], false, va, vb, clear[k], clear[k + 1]);
+                    let run = fit::plan_run(smp, va, vb, o);
+                    let (ia, ib) = (ids[runs.len()], ids[runs.len() + 1]);
+                    if run.line {
+                        rg.add_line(ia, ib, run.samples.clone());
+                    } else if let Some((ta, tb)) = fit::run_end_tangents(&run, va, vb) {
+                        rg.add_curve_end(ia, ta);
+                        rg.add_curve_end(ib, tb);
+                    }
+                    runs.push(run);
+                }
+                plans.push(Plan::Runs { ids, runs, closed: false });
+            }
+        }
+        // Shapes for the regulariser: the anchor cycle of every face.
+        for cycles in self.faces(reg) {
+            for cyc in cycles {
+                let mut shape: Vec<usize> = Vec::new();
+                for &(id, fwd) in &cyc {
+                    if let Plan::Runs { ids, .. } = &plans[id as usize] {
+                        if fwd {
+                            shape.extend(ids.iter().copied());
+                        } else {
+                            shape.extend(ids.iter().rev().copied());
                         }
                     }
-                    samples.push(vb);
-                    let prefix: &[Point] = if a == 0 { ghosts.get(&(ei, true)).map(|v| v.as_slice()).unwrap_or(&[]) } else { &[] };
-                    let suffix: &[Point] = if b == m - 1 { ghosts.get(&(ei, false)).map(|v| v.as_slice()).unwrap_or(&[]) } else { &[] };
-                    if prefix.is_empty() && suffix.is_empty() {
-                        e.els.extend(fit::fit_run(&samples, false, o).1);
-                    } else {
-                        e.els.extend(fit::fit_run_ghost(&samples, prefix, suffix, o));
+                }
+                shape.dedup();
+                if shape.len() > 1 && shape.first() == shape.last() {
+                    shape.pop();
+                }
+                if shape.len() >= 3 {
+                    rg.shapes.push(shape);
+                }
+            }
+        }
+        rg.regularize(ropts);
+        // Fit every run between its (possibly moved) anchors.
+        for (ei, (e, plan)) in self.edges.iter_mut().zip(&plans).enumerate() {
+            match plan {
+                Plan::Fixed { start, end, els } => {
+                    e.start = *start;
+                    e.end = *end;
+                    e.els = els.clone();
+                }
+                Plan::Runs { ids, runs, closed } => {
+                    let m = ids.len();
+                    let start = rg.pos[ids[0]];
+                    let mut els = Vec::new();
+                    for (i, run) in runs.iter().enumerate() {
+                        let (a, b) = (ids[i], ids[(i + 1) % m]);
+                        let prefix: &[Point] = if !closed && i == 0 { ghosts.get(&(ei, true)).map(|v| v.as_slice()).unwrap_or(&[]) } else { &[] };
+                        let suffix: &[Point] = if !closed && i + 1 == runs.len() { ghosts.get(&(ei, false)).map(|v| v.as_slice()).unwrap_or(&[]) } else { &[] };
+                        els.extend(fit::emit_run(run, rg.pos[a], rg.pos[b], prefix, suffix, o));
                     }
-                }
-                if e.els.is_empty() {
-                    e.els.push(El::LineTo(e.end));
-                }
-                if std::env::var("VECTORIZE_DEBUG").as_deref() == Ok("edges") {
-                    let runs: Vec<String> = cs
-                        .windows(2)
-                        .map(|w| format!("{}", po[w[1]] - po[w[0]]))
-                        .collect();
-                    eprintln!(
-                        "edge: steps {} verts {} corners {} els {} ({} lines) runs {}",
-                        e.dirs.len(),
-                        m,
-                        cs.len(),
-                        e.els.len(),
-                        e.els.iter().filter(|x| matches!(x, El::LineTo(_))).count(),
-                        runs.join(",")
-                    );
+                    e.start = start;
+                    e.end = if *closed { start } else { rg.pos[*ids.last().unwrap()] };
+                    if els.is_empty() {
+                        els.push(El::LineTo(e.end));
+                    }
+                    e.els = els;
+                    if std::env::var("VECTORIZE_DEBUG").as_deref() == Ok("edges") {
+                        eprintln!(
+                            "edge: closed {} anchors {} els {} ({} lines, {} line runs)",
+                            closed,
+                            m,
+                            e.els.len(),
+                            e.els.iter().filter(|x| matches!(x, El::LineTo(_))).count(),
+                            runs.iter().filter(|r| r.line).count()
+                        );
+                    }
                 }
             }
         }
@@ -675,20 +782,6 @@ fn end_of(el: &El) -> Point {
     el.end().unwrap_or(Point::ZERO)
 }
 
-/// Start point and the elements after `MoveTo`, without `ClosePath`.
-fn split_path(path: &Path) -> (Option<Point>, Vec<El>) {
-    let mut start = None;
-    let mut els = Vec::new();
-    for el in path.elements() {
-        match el {
-            El::MoveTo(p) => start = Some(*p),
-            El::Close => {}
-            other => els.push(*other),
-        }
-    }
-    (start, els)
-}
-
 /// The same curve walked backwards: from the last end point back to `start`.
 pub fn reverse_els(start: Point, els: &[El]) -> Vec<El> {
     let mut out = Vec::with_capacity(els.len());
@@ -702,6 +795,7 @@ pub fn reverse_els(start: Point, els: &[El]) -> Vec<El> {
         out.push(match *el {
             El::CurveTo(a, b, _) => El::CurveTo(b, a, q),
             El::ArcTo { r, large, sweep, .. } => El::ArcTo { r, large, sweep: !sweep, end: q },
+            El::EllipseTo { rx, ry, rot, large, sweep, .. } => El::EllipseTo { rx, ry, rot, large, sweep: !sweep, end: q },
             _ => El::LineTo(q),
         });
     }
@@ -731,7 +825,7 @@ mod tests {
         // Two squares b and c on a field of a: a|b, a|c, b|c boundaries and
         // two junctions where all three meet.
         let mut mm = map(&["aaaaaa", "abbcca", "abbcca", "aaaaaa"]);
-        let reg = label(&mut mm, Some(1), 1);
+        let reg = label(&mut mm, Some(1), 1, |_, _| 0.0);
         let g = Graph::build(&reg);
         let ids: std::collections::HashSet<(u32, u32)> =
             g.edges.iter().map(|e| (e.left.min(e.right), e.left.max(e.right))).collect();
@@ -759,11 +853,11 @@ mod tests {
     #[test]
     fn fitted_edges_make_closed_gapless_paths() {
         let mut mm = map(&["aaaaaaaa", "abbbccca", "abbbccca", "abbbccca", "aaaaaaaa"]);
-        let reg = label(&mut mm, Some(1), 1);
+        let reg = label(&mut mm, Some(1), 1, |_, _| 0.0);
         let mut g = Graph::build(&reg);
         let o = FitOpts { accuracy: 0.3, snap_lines: true, window: 1.0 };
-        let copts = fit::CornerOpts { alphamax: 1.0, min_turn: 0.35, accuracy: 0.3, window: 1.0 };
-        g.fit(&reg, &mm, 0.2, 1.5, &copts, &o);
+        let copts = fit::CornerOpts { alphamax: 1.0, min_turn: 0.35, strong_turn: 1.31, g1_angle: 0.26, short_edge: 2.0, accuracy: 0.3, window: 1.0 };
+        g.fit(&reg, &mm, &polygon::PolygonOpts::new(0.2, 1.5), &copts, &o, &regularity::RegOpts::from_strength(0.5, 0.3), Some(&primitives::PrimOpts::new(0.3)));
         let faces = g.faces(&reg);
         let b = reg.get(1, 1) as usize;
         let mut path = Path::new();

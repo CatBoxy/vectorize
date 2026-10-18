@@ -51,3 +51,20 @@ impl Raster {
         best
     }
 }
+
+/// Nearest-neighbour upscale by an integer factor: every pixel becomes a
+/// `k × k` block.
+pub fn upscale_nearest(img: &Raster, k: u32) -> Raster {
+    let (w, h) = (img.width * k, img.height * k);
+    let mut data = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        let sy = y / k;
+        for x in 0..w {
+            let sx = x / k;
+            let i = ((sy * img.width + sx) * 4) as usize;
+            let j = ((y * w + x) * 4) as usize;
+            data[j..j + 4].copy_from_slice(&img.data[i..i + 4]);
+        }
+    }
+    Raster { width: w, height: h, data }
+}
