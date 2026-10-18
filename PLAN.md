@@ -332,8 +332,51 @@ Status 2026-10-14: M1 exit criterion met on the bw corpus (835 images, defaults)
 | 1024 | 0.06 | 0.12 | 50.2 | 75.7 | 33.5 |
 
 `bench compare potrace ours` passes (it reads bench/baselines.json when no potrace run exists). The
-worst bw images are all 64 px JPEGs with ringing specks and the Starbucks logo; the colour and
-synthetic sets are traced as black and white until M2 and score accordingly.
+worst bw images are all 64 px JPEGs with ringing specks and the Starbucks logo.
+
+Status 2026-10-14, later: M2 exit criterion met. Full corpus (1500 images, defaults), ours vs VTracer:
+
+| size | ΔE ours | ΔE VTracer | nodes ours | nodes VTracer | ms ours (in-process) |
+|---|---|---|---|---|---|
+| 64 | 1.50 | 4.24 | 66.7 | 95.9 | 4.0 |
+| 128 | 0.68 | 2.33 | 67.0 | 129.9 | 8.7 |
+| 256 | 0.36 | 1.34 | 92.3 | 174.7 | 16.4 |
+| 512 | 0.19 | 0.81 | 138.9 | 246.7 | 44.6 |
+| 1024 | 0.10 | 0.56 | 227.4 | 406.2 | 145.5 |
+
+Colour set alone (535 images): abutting ΔE 0.95, 275 nodes, 3.8 paths; overlapping (stacked) ΔE 0.92,
+224 nodes, 6.0 paths; VTracer ΔE 2.56, 390 nodes, 29 paths. The bw set improved to ΔE 0.36 / 34.0 nodes
+from the shared contour fixes. Both `bench compare` gates pass. Zero seams: verified by rendering each
+shape alone and checking that coverages sum to one everywhere (rendering abutting shapes together shows
+hairlines from the renderer's own anti-aliasing, which is not a gap in the geometry).
+
+What M2 ended up as, and where it departs from the recipe above:
+- Palette: OKLab k-means seeded from a 5-bit histogram of interior pixels, merge below 0.04, then an
+  iterative pass that adds the most populous cluster of opaque edge pixels not explainable as a
+  colour or an sRGB mix of two colours (a 1 px line has no interior; adding black explains every grey
+  at once). Background: border majority (transparent, a colour, or none).
+- Coverage per colour is not stored as planes: each pixel is a mix of two labels with a fraction.
+  Unmixing is done in sRGB, where anti-aliasing actually blends, against the pair of colours present
+  in the pixel's 5×5 neighbourhood (the nearest palette colour overall is only a fallback partner;
+  insisting on it gave every black-on-yellow edge a red endpoint and 2000-node outlines).
+- Regions: 4-connected components with a per-corner diagonal-join policy (join the non-background,
+  else the rarer, colour), speckles merged into the neighbour with the longest border and recoloured.
+- Boundary graph: junctions are pixel corners of degree ≥ 3; chains between them and junction-free
+  loops are the edges. Each is refined to sub-pixel points by the M1 rule with the left region's
+  coverage, polygonised (open variant with pinned ends), fitted once, and stored with its left and
+  right face. Junction positions: least-squares meeting point of the lines through each incident
+  chain's first unbiased points, within 1 px of the corner. Faces are walked with the M1 pixel rule
+  and reuse the fitted edges forwards or reversed, so adjacent shapes share geometry exactly.
+- Abutting output: one path per colour. Overlapping (stacked) output: each region's outer boundary
+  plus only the holes that border something unpainted, painted in order of containment depth, where
+  a region's parent is the region in whose hole it lies (flood fill of the adjacency graph from the
+  hole's boundary without crossing the owner, innermost holes first, nothing larger than the hole).
+  Area order and shared-border-length heuristics both fail on outline rings and JPEG halos.
+- The run-length rule for real corners and chamfers went from 2 to 3 steps: a smooth curve through
+  45° makes runs of one and two, and the old rule manufactured corners off the curve.
+- Continuity across junctions (pairing edges that continue smoothly through a junction) is not done;
+  each chain's end tangent is one-sided. Deferred to M3 with the corner model.
+
 
 What M1 ended up as, and where it departs from the recipe above:
 - Boundary: Potrace path decomposition for topology, then one sub-pixel point per pixel step by

@@ -7,21 +7,29 @@
 //!   Raster → Palette → CoverageFields → RegionMap → BoundaryGraph → PolyGraph
 //!   → CurveGraph → Scene → SVG + Stats
 //!
-//! M1 ships the black-and-white pipeline ([`bw`]): darkness coverage,
+//! M1 is the black-and-white pipeline ([`bw`]): darkness coverage,
 //! Potrace-style path decomposition, sub-pixel contours from anti-aliasing,
-//! optimal polygon, corner/curve classification and curve optimisation.
-//! Grayscale and colour modes fall back to it until M2.
+//! optimal polygon, corner classification and curve fitting.
+//! M2 is the colour pipeline ([`color`]): OKLab palette, per-pixel unmixing,
+//! regions, and a boundary graph whose every edge is fitted once and shared
+//! by the faces on both sides.
 
 pub mod bitmap;
 pub mod bw;
+pub mod chain;
+pub mod color;
 pub mod contour;
 pub mod coverage;
 pub mod curve;
 pub mod decompose;
 pub mod fit;
+pub mod graph;
+pub mod mix;
+pub mod palette;
 pub mod params;
 pub mod polygon;
 pub mod raster;
+pub mod regions;
 pub mod scene;
 pub mod svg;
 
@@ -51,9 +59,11 @@ pub struct Traced {
 
 /// Trace a raster image into an SVG scene.
 pub fn trace(img: &Raster, params: &Params) -> Traced {
-    // M1: every mode is traced as black and white.
     let mut clock = StageClock::start();
-    let scene = bw::trace_bw(img, params, &mut clock);
+    let scene = match params.mode {
+        params::Mode::BlackAndWhite => bw::trace_bw(img, params, &mut clock),
+        params::Mode::Grayscale | params::Mode::Color => color::trace_color(img, params, &mut clock),
+    };
     finish(scene, clock)
 }
 
@@ -108,6 +118,11 @@ mod tests {
     use super::*;
     use kurbo::{ParamCurve, PathEl, Shape as _};
 
+    /// The M1 pipeline, which these tests exercise.
+    fn bw() -> Params {
+        Params { mode: params::Mode::BlackAndWhite, ..Params::default() }
+    }
+
     /// Anti-aliased disc: coverage by 8×8 supersampling.
     fn disc(size: u32, cx: f64, cy: f64, r: f64) -> Raster {
         let mut img = Raster::filled(size, size, [255, 255, 255, 255]);
@@ -138,7 +153,7 @@ mod tests {
                 img.set(x, y, [0, 0, 0, 255]);
             }
         }
-        let out = trace(&img, &Params::default());
+        let out = trace(&img, &bw());
         assert_eq!(out.stats.paths, 1);
         assert_eq!(out.stats.nodes, 4, "{}", out.svg);
         assert_eq!(out.stats.colors, 1);
@@ -151,7 +166,7 @@ mod tests {
     #[test]
     fn blank_image_is_empty() {
         let img = Raster::filled(8, 8, [255, 255, 255, 255]);
-        let out = trace(&img, &Params::default());
+        let out = trace(&img, &bw());
         assert_eq!(out.stats.paths, 0);
     }
 
@@ -159,7 +174,7 @@ mod tests {
     fn circle_is_few_nodes_and_subpixel_accurate() {
         let (cx, cy, r) = (64.0, 64.0, 40.0);
         let img = disc(128, cx, cy, r);
-        let out = trace(&img, &Params { fit_accuracy: 0.2, ..Params::default() });
+        let out = trace(&img, &Params { fit_accuracy: 0.2, ..bw() });
         assert_eq!(out.stats.paths, 1);
         assert!(out.stats.nodes <= 8, "{} nodes: {}", out.stats.nodes, out.svg);
         // Walk the path densely and measure radial error.
@@ -186,7 +201,7 @@ mod tests {
             img.data[i + 1] = img.data[i];
             img.data[i + 2] = img.data[i];
         }
-        let out = trace(&img, &Params::default());
+        let out = trace(&img, &bw());
         let els = out.scene.shapes[0].path.elements();
         let moves = els.iter().filter(|e| matches!(e, PathEl::MoveTo(_))).count();
         assert_eq!(moves, 2, "{}", out.svg);
@@ -202,7 +217,7 @@ mod tests {
         for x in 5..35 {
             img.set(x, 10, [0, 0, 0, 255]);
         }
-        let out = trace(&img, &Params { min_area: 1, ..Params::default() });
+        let out = trace(&img, &Params { min_area: 1, ..bw() });
         assert_eq!(out.stats.paths, 1);
         assert_eq!(out.stats.nodes, 4, "{}", out.svg);
         let bbox = out.scene.shapes[0].path.bounding_box();
@@ -220,7 +235,7 @@ mod tests {
         img.set(2, 2, [0, 0, 0, 255]);
         img.set(30, 30, [0, 0, 0, 255]);
         img.set(31, 30, [0, 0, 0, 255]);
-        let out = trace(&img, &Params::default());
+        let out = trace(&img, &bw());
         assert_eq!(out.stats.nodes, 4, "{}", out.svg);
     }
 
@@ -238,7 +253,7 @@ mod tests {
                     img.set(x, y, [v, v, v, (seed >> 8) as u8 | 128]);
                 }
             }
-            let out = trace(&img, &Params { min_area: 1, ..Params::default() });
+            let out = trace(&img, &Params { min_area: 1, ..bw() });
             for s in &out.scene.shapes {
                 let els = s.path.elements();
                 assert!(matches!(els.last(), Some(PathEl::ClosePath)));

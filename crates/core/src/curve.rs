@@ -95,6 +95,18 @@ pub fn corner_flags(verts: &[Point], alphamax: f64) -> Vec<bool> {
     smooth(verts, alphamax).corner
 }
 
+/// The Potrace alpha test for one vertex `v` between `prev` and `next`.
+pub fn is_corner(prev: Point, v: Point, next: Point, alphamax: f64) -> bool {
+    let denom = ddenom(prev, next);
+    let alpha = if denom != 0.0 {
+        let dd = (dpara(prev, v, next) / denom).abs();
+        (if dd > 1.0 { 1.0 - 1.0 / dd } else { 0.0 }) / 0.75
+    } else {
+        4.0 / 3.0
+    };
+    alpha >= alphamax
+}
+
 /// Append one closed subpath for `segs` (as produced by [`fit`]).
 pub fn append_subpath(path: &mut BezPath, segs: &[Seg]) {
     let m = segs.len();

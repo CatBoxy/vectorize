@@ -41,6 +41,168 @@ pub fn polygonize(pts: &[Point], dirs: &[u8], tol: f64, vbox: f64) -> (Vec<Point
     (verts, po)
 }
 
+/// Polygon for an open chain with both ends pinned: adjusted vertex
+/// positions (first and last are `pts[0]` and `pts[n-1]`) and the contour
+/// index of each.
+pub fn polygonize_open(pts: &[Point], dirs: &[u8], tol: f64, vbox: f64) -> (Vec<Point>, Vec<usize>) {
+    let n = pts.len();
+    if n < 3 || dirs.len() != n {
+        return (pts.to_vec(), (0..n).collect());
+    }
+    let sums = calc_sums(pts);
+    let lon = calc_lon_open(pts, dirs, 2.0 * tol);
+    let mut po = best_polygon_open(pts, &sums, &lon);
+    merge_cut_corners_open(&mut po, pts, &sums, MERGE_CHORD, MERGE_NEAR);
+    let verts = adjust_vertices_open(pts, &sums, &po, vbox);
+    (verts, po)
+}
+
+/// Open-chain `lon`: furthest `k` such that `i..=k` is straight, no wrap.
+fn calc_lon_open(pts: &[Point], dirs: &[u8], h: f64) -> Vec<usize> {
+    let n = pts.len();
+    let mut lon = vec![0usize; n];
+    for i in 0..n {
+        let mut ct = [0u32; 4];
+        ct[(dirs[i] & 3) as usize] += 1;
+        let (mut c0, mut c1) = (Vec2::ZERO, Vec2::ZERO);
+        let mut last = i;
+        for k in i + 1..n {
+            let forced = k == i + 1;
+            ct[(dirs[k] & 3) as usize] += 1;
+            if !forced && ct.iter().all(|&c| c > 0) {
+                break;
+            }
+            let cur = pts[k] - pts[i];
+            if !forced && (c0.cross(cur) < 0.0 || c1.cross(cur) > 0.0) {
+                break;
+            }
+            if cur.x.abs() > h || cur.y.abs() > h {
+                let off = Vec2::new(
+                    cur.x + if cur.y >= 0.0 && (cur.y > 0.0 || cur.x < 0.0) { h } else { -h },
+                    cur.y + if cur.x <= 0.0 && (cur.x < 0.0 || cur.y < 0.0) { h } else { -h },
+                );
+                if c0.cross(off) >= 0.0 {
+                    c0 = off;
+                }
+                let off = Vec2::new(
+                    cur.x + if cur.y <= 0.0 && (cur.y < 0.0 || cur.x < 0.0) { h } else { -h },
+                    cur.y + if cur.x >= 0.0 && (cur.x > 0.0 || cur.y < 0.0) { h } else { -h },
+                );
+                if c1.cross(off) <= 0.0 {
+                    c1 = off;
+                }
+            }
+            last = k;
+        }
+        lon[i] = last;
+    }
+    lon
+}
+
+/// Fewest segments from 0 to n-1 over straight runs, then least penalty.
+fn best_polygon_open(pts: &[Point], sums: &[Sum], lon: &[usize]) -> Vec<usize> {
+    let n = pts.len();
+    let mut best: Vec<(usize, f64)> = vec![(usize::MAX, f64::MAX); n];
+    let mut prev = vec![0usize; n];
+    best[0] = (0, 0.0);
+    for j in 1..n {
+        for i in (0..j).rev() {
+            if lon[i] < j || best[i].0 == usize::MAX {
+                continue;
+            }
+            let cand = (best[i].0 + 1, best[i].1 + penalty3(pts, sums, i, j));
+            if cand.0 < best[j].0 || (cand.0 == best[j].0 && cand.1 < best[j].1) {
+                best[j] = cand;
+                prev[j] = i;
+            }
+        }
+    }
+    let mut po = vec![n - 1];
+    let mut j = n - 1;
+    while j > 0 {
+        j = prev[j];
+        po.push(j);
+    }
+    po.reverse();
+    po
+}
+
+/// `merge_cut_corners` for an open polygon: never touches the end vertices.
+fn merge_cut_corners_open(po: &mut Vec<usize>, pts: &[Point], sums: &[Sum], max_chord: f64, near: f64) {
+    let n = pts.len();
+    let origin = pts[0];
+    loop {
+        let m = po.len();
+        if m <= 3 {
+            return;
+        }
+        let mut merged = false;
+        for i in 1..m - 2 {
+            let (a, b) = (po[i], po[i + 1]);
+            if (pts[b] - pts[a]).hypot() >= max_chord {
+                continue;
+            }
+            let (p, q) = (po[i - 1], po[i + 2]);
+            let (ca, da) = pointslope(sums, n, p, a);
+            let (cb, db) = pointslope(sums, n, b, q);
+            let det = da.cross(db);
+            if det.abs() < 1e-9 {
+                continue;
+            }
+            let t = (cb - ca).cross(db) / det;
+            let x = origin + ca + da * t;
+            let mid = pts[a].midpoint(pts[b]);
+            if (x - mid).hypot() <= near {
+                po.remove(i + 1);
+                merged = true;
+                break;
+            }
+        }
+        if !merged {
+            return;
+        }
+    }
+}
+
+/// `adjust_vertices` for an open polygon: the ends stay where they are.
+fn adjust_vertices_open(pts: &[Point], sums: &[Sum], po: &[usize], vbox: f64) -> Vec<Point> {
+    let m = po.len();
+    let n = pts.len();
+    let origin = pts[0];
+    let mut out = Vec::with_capacity(m);
+    if m == 0 {
+        return out;
+    }
+    let mut q = vec![[[0.0f64; 3]; 3]; m.saturating_sub(1)];
+    for i in 0..m.saturating_sub(1) {
+        let (ctr, dir) = pointslope(sums, n, po[i], po[i + 1]);
+        let d = dir.x * dir.x + dir.y * dir.y;
+        if d != 0.0 {
+            let v = [dir.y, -dir.x, dir.x * ctr.y - dir.y * ctr.x];
+            for l in 0..3 {
+                for k in 0..3 {
+                    q[i][l][k] = v[l] * v[k] / d;
+                }
+            }
+        }
+    }
+    out.push(pts[po[0]]);
+    for i in 1..m.saturating_sub(1) {
+        let s = pts[po[i]] - origin;
+        let mut qq: Quad = [[0.0; 3]; 3];
+        for l in 0..3 {
+            for k in 0..3 {
+                qq[l][k] = q[i - 1][l][k] + q[i][l][k];
+            }
+        }
+        out.push(origin + minimise_in_box(&mut qq, s, vbox));
+    }
+    if m > 1 {
+        out.push(pts[po[m - 1]]);
+    }
+    out
+}
+
 /// A polygon edge shorter than this may be a cut corner, px.
 pub const MERGE_CHORD: f64 = 3.0;
 /// ... when the two neighbouring edge lines meet within this distance of
@@ -369,77 +531,82 @@ fn adjust_vertices(pts: &[Point], sums: &[Sum], po: &[usize], vbox: f64) -> Vec<
                 qq[l][k] = q[j][l][k] + q[i][l][k];
             }
         }
-        // Minimise the quadratic form; if the lines are parallel, add an
-        // orthogonal axis through the vertex until the system is regular.
-        let mut w = s;
-        for _ in 0..4 {
-            let det = qq[0][0] * qq[1][1] - qq[0][1] * qq[1][0];
-            if det != 0.0 {
-                w = Vec2::new(
-                    (-qq[0][2] * qq[1][1] + qq[1][2] * qq[0][1]) / det,
-                    (qq[0][2] * qq[1][0] - qq[1][2] * qq[0][0]) / det,
-                );
-                break;
-            }
-            let (v0, v1) = if qq[0][0] > qq[1][1] {
-                (-qq[0][1], qq[0][0])
-            } else if qq[1][1] != 0.0 {
-                (-qq[1][1], qq[1][0])
-            } else {
-                (1.0, 0.0)
-            };
-            let d = v0 * v0 + v1 * v1;
-            let v = [v0, v1, -v1 * s.y - v0 * s.x];
-            for l in 0..3 {
-                for k in 0..3 {
-                    qq[l][k] += v[l] * v[k] / d;
-                }
-            }
-        }
-        if (w.x - s.x).abs() <= vbox && (w.y - s.y).abs() <= vbox && w.x.is_finite() && w.y.is_finite() {
-            out.push(origin + w);
-            continue;
-        }
-        // Minimum is outside the box: search its edges and corners.
-        let mut min = quadform(&qq, s);
-        let mut best = s;
-        if qq[0][0] != 0.0 {
-            for z in 0..2 {
-                let wy = s.y - vbox + 2.0 * vbox * z as f64;
-                let wx = -(qq[0][1] * wy + qq[0][2]) / qq[0][0];
-                let cand = Vec2::new(wx, wy);
-                let c = quadform(&qq, cand);
-                if (wx - s.x).abs() <= vbox && c < min {
-                    min = c;
-                    best = cand;
-                }
-            }
-        }
-        if qq[1][1] != 0.0 {
-            for z in 0..2 {
-                let wx = s.x - vbox + 2.0 * vbox * z as f64;
-                let wy = -(qq[1][0] * wx + qq[1][2]) / qq[1][1];
-                let cand = Vec2::new(wx, wy);
-                let c = quadform(&qq, cand);
-                if (wy - s.y).abs() <= vbox && c < min {
-                    min = c;
-                    best = cand;
-                }
-            }
-        }
-        for l in 0..2 {
-            for k in 0..2 {
-                let cand = Vec2::new(s.x - vbox + 2.0 * vbox * l as f64, s.y - vbox + 2.0 * vbox * k as f64);
-                let c = quadform(&qq, cand);
-                if c < min {
-                    min = c;
-                    best = cand;
-                }
-            }
-        }
-        out.push(origin + best);
+        out.push(origin + minimise_in_box(&mut qq, s, vbox));
     }
     out
+}
+
+/// Minimise the quadratic form `qq` (sum of two line distance forms) near
+/// `s`, inside the box of half-width `vbox` around it. If the lines are
+/// parallel, an orthogonal axis through `s` is added until the system is
+/// regular; if the minimum falls outside the box, its edges and corners are
+/// searched.
+fn minimise_in_box(qq: &mut Quad, s: Vec2, vbox: f64) -> Vec2 {
+    let mut w = s;
+    for _ in 0..4 {
+        let det = qq[0][0] * qq[1][1] - qq[0][1] * qq[1][0];
+        if det != 0.0 {
+            w = Vec2::new(
+                (-qq[0][2] * qq[1][1] + qq[1][2] * qq[0][1]) / det,
+                (qq[0][2] * qq[1][0] - qq[1][2] * qq[0][0]) / det,
+            );
+            break;
+        }
+        let (v0, v1) = if qq[0][0] > qq[1][1] {
+            (-qq[0][1], qq[0][0])
+        } else if qq[1][1] != 0.0 {
+            (-qq[1][1], qq[1][0])
+        } else {
+            (1.0, 0.0)
+        };
+        let d = v0 * v0 + v1 * v1;
+        let v = [v0, v1, -v1 * s.y - v0 * s.x];
+        for l in 0..3 {
+            for k in 0..3 {
+                qq[l][k] += v[l] * v[k] / d;
+            }
+        }
+    }
+    if (w.x - s.x).abs() <= vbox && (w.y - s.y).abs() <= vbox && w.x.is_finite() && w.y.is_finite() {
+        return w;
+    }
+    let mut min = quadform(qq, s);
+    let mut best = s;
+    if qq[0][0] != 0.0 {
+        for z in 0..2 {
+            let wy = s.y - vbox + 2.0 * vbox * z as f64;
+            let wx = -(qq[0][1] * wy + qq[0][2]) / qq[0][0];
+            let cand = Vec2::new(wx, wy);
+            let c = quadform(qq, cand);
+            if (wx - s.x).abs() <= vbox && c < min {
+                min = c;
+                best = cand;
+            }
+        }
+    }
+    if qq[1][1] != 0.0 {
+        for z in 0..2 {
+            let wx = s.x - vbox + 2.0 * vbox * z as f64;
+            let wy = -(qq[1][0] * wx + qq[1][2]) / qq[1][1];
+            let cand = Vec2::new(wx, wy);
+            let c = quadform(qq, cand);
+            if (wy - s.y).abs() <= vbox && c < min {
+                min = c;
+                best = cand;
+            }
+        }
+    }
+    for l in 0..2 {
+        for k in 0..2 {
+            let cand = Vec2::new(s.x - vbox + 2.0 * vbox * l as f64, s.y - vbox + 2.0 * vbox * k as f64);
+            let c = quadform(qq, cand);
+            if c < min {
+                min = c;
+                best = cand;
+            }
+        }
+    }
+    best
 }
 
 #[cfg(test)]

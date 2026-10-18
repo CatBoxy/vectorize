@@ -37,6 +37,22 @@ impl Scene {
         Self { width, height, shapes: Vec::new() }
     }
 
+    /// One SVG document per shape, each filled black: lets a test render the
+    /// shapes separately and add up their coverages.
+    pub fn scene_shapes_for_test(&self) -> Vec<String> {
+        self.shapes
+            .iter()
+            .map(|s| {
+                let one = Scene {
+                    width: self.width,
+                    height: self.height,
+                    shapes: vec![Shape { path: s.path.clone(), fill: Fill::Solid([0, 0, 0, 255]) }],
+                };
+                crate::svg::write(&one)
+            })
+            .collect()
+    }
+
     pub fn distinct_colors(&self) -> usize {
         let mut cs: Vec<[u8; 4]> = self
             .shapes
