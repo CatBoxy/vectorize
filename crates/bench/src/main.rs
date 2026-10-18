@@ -59,9 +59,9 @@ enum Cmd {
         /// JSON params passed to `ours`.
         #[arg(long)]
         params: Option<String>,
-        /// Write diff PNGs and re-rasterized output PNGs for the report.
-        #[arg(long, default_value_t = true)]
-        images: bool,
+        /// Skip the diff PNGs and re-rasterized output PNGs for the report.
+        #[arg(long)]
+        no_images: bool,
     },
     /// Fail if B regresses from A beyond the gate (L1 > 2%, nodes > 10% per size bucket).
     Compare { a: String, b: String },
@@ -78,9 +78,9 @@ fn main() -> Result<()> {
     let root = cli.root.canonicalize()?;
     match cli.cmd {
         Cmd::BuildCorpus { sizes, jpeg_every } => corpus::build(&root, &sizes, jpeg_every),
-        Cmd::Run { tracer, name, sets, sizes, filter, params, images } => run::run(
+        Cmd::Run { tracer, name, sets, sizes, filter, params, no_images } => run::run(
             &root,
-            run::RunOpts { tracer, name, sets, sizes, filter, params, images },
+            run::RunOpts { tracer, name, sets, sizes, filter, params, images: !no_images },
         ),
         Cmd::Compare { a, b } => compare::compare(&root, &a, &b),
         Cmd::Report { worst } => report::report(&root, worst),

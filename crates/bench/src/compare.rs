@@ -18,7 +18,18 @@ pub fn compare(root: &Path, a: &str, b: &str) -> Result<()> {
         if !k.starts_with("all/") {
             continue;
         }
-        let Some(bb) = rb.buckets.get(k) else { continue };
+        // A black-and-white-only baseline was scored on the bw set alone, so
+        // its all/<size> buckets correspond to the other run's bw/<size>.
+        // Pair buckets by image count, not by name.
+        let alt = k.replacen("all/", "bw/", 1);
+        let Some(bb) = [k.as_str(), alt.as_str()]
+            .iter()
+            .filter_map(|key| rb.buckets.get(*key))
+            .find(|bb| bb.n == ba.n)
+            .or_else(|| rb.buckets.get(k))
+        else {
+            continue;
+        };
         let mut flag = String::new();
         if bb.delta_e > ba.delta_e * (1.0 + MAX_DELTA_E_REL) + 0.01 {
             flag.push_str(" ΔE↑");

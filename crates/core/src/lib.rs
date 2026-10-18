@@ -7,11 +7,20 @@
 //!   Raster → Palette → CoverageFields → RegionMap → BoundaryGraph → PolyGraph
 //!   → CurveGraph → Scene → SVG + Stats
 //!
-//! M0 ships only the types, the SVG writer and a stub `trace` that emits the
-//! bounding rectangle of the non-background pixels. Every later milestone
-//! replaces one stage at a time behind the same signature.
+//! M1 ships the black-and-white pipeline ([`bw`]): darkness coverage,
+//! Potrace-style path decomposition, sub-pixel contours from anti-aliasing,
+//! optimal polygon, corner/curve classification and curve optimisation.
+//! Grayscale and colour modes fall back to it until M2.
 
+pub mod bitmap;
+pub mod bw;
+pub mod contour;
+pub mod coverage;
+pub mod curve;
+pub mod decompose;
+pub mod fit;
 pub mod params;
+pub mod polygon;
 pub mod raster;
 pub mod scene;
 pub mod svg;
@@ -27,6 +36,9 @@ pub struct Stats {
     pub nodes: usize,
     pub colors: usize,
     pub svg_bytes: usize,
+    /// Wall time per pipeline stage, in order. Zeros on wasm32.
+    #[serde(default)]
+    pub stage_ms: Vec<(String, f64)>,
 }
 
 /// Output of a trace: the SVG text and its statistics.
@@ -39,88 +51,87 @@ pub struct Traced {
 
 /// Trace a raster image into an SVG scene.
 pub fn trace(img: &Raster, params: &Params) -> Traced {
-    let scene = stub::trace_stub(img, params);
-    finish(scene)
+    // M1: every mode is traced as black and white.
+    let mut clock = StageClock::start();
+    let scene = bw::trace_bw(img, params, &mut clock);
+    finish(scene, clock)
 }
 
 /// Assemble `Scene` → SVG string + stats. Shared by every tracer version.
-pub fn finish(scene: Scene) -> Traced {
+pub fn finish(scene: Scene, mut clock: StageClock) -> Traced {
     let svg = svg::write(&scene);
+    clock.lap("emit");
     let stats = Stats {
         paths: scene.shapes.len(),
         nodes: scene.shapes.iter().map(|s| s.node_count()).sum(),
         colors: scene.distinct_colors(),
         svg_bytes: svg.len(),
+        stage_ms: clock.laps,
     };
     Traced { svg, stats, scene }
 }
 
-mod stub {
-    use crate::{Fill, Params, Raster, Scene, Shape};
-    use kurbo::{BezPath, Rect};
+/// Per-stage wall clock. A no-op on wasm32, where `Instant` is unavailable.
+#[derive(Debug, Default)]
+pub struct StageClock {
+    #[cfg(not(target_arch = "wasm32"))]
+    t: Option<std::time::Instant>,
+    pub laps: Vec<(String, f64)>,
+}
 
-    /// M0 placeholder: one rectangle covering the non-background pixels, filled
-    /// with the mean colour of those pixels. Exists so the harness runs end to
-    /// end and scores it worst.
-    pub fn trace_stub(img: &Raster, _params: &Params) -> Scene {
-        let bg = img.corner_color();
-        let (mut x0, mut y0, mut x1, mut y1) = (img.width, img.height, 0, 0);
-        let (mut sum, mut n) = ([0u64; 3], 0u64);
-        for y in 0..img.height {
-            for x in 0..img.width {
-                let p = img.get(x, y);
-                if p[3] < 128 {
-                    continue;
-                }
-                // Transparent background: every opaque pixel is foreground.
-                if bg[3] >= 128 && color_dist2(p, bg) < 24 * 24 {
-                    continue;
-                }
-                x0 = x0.min(x);
-                y0 = y0.min(y);
-                x1 = x1.max(x + 1);
-                y1 = y1.max(y + 1);
-                for c in 0..3 {
-                    sum[c] += p[c] as u64;
-                }
-                n += 1;
-            }
+impl StageClock {
+    pub fn start() -> Self {
+        Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            t: Some(std::time::Instant::now()),
+            laps: Vec::new(),
         }
-        let mut scene = Scene::new(img.width, img.height);
-        if n == 0 {
-            return scene;
-        }
-        let mean = [
-            (sum[0] / n) as u8,
-            (sum[1] / n) as u8,
-            (sum[2] / n) as u8,
-            255,
-        ];
-        let rect = Rect::new(x0 as f64, y0 as f64, x1 as f64, y1 as f64);
-        let path: BezPath = kurbo::Shape::to_path(&rect, 0.0);
-        scene.shapes.push(Shape {
-            path,
-            fill: Fill::Solid(mean),
-        });
-        scene
     }
 
-    fn color_dist2(a: [u8; 4], b: [u8; 4]) -> i32 {
-        (0..3)
-            .map(|c| {
-                let d = a[c] as i32 - b[c] as i32;
-                d * d
-            })
-            .sum()
+    /// Record the time since the previous lap under `name`.
+    pub fn lap(&mut self, name: &str) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let ms = {
+            let now = std::time::Instant::now();
+            let ms = self.t.map(|t| now.duration_since(t).as_secs_f64() * 1000.0).unwrap_or(0.0);
+            self.t = Some(now);
+            ms
+        };
+        #[cfg(target_arch = "wasm32")]
+        let ms = 0.0;
+        self.laps.push((name.to_string(), ms));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kurbo::{ParamCurve, PathEl, Shape as _};
+
+    /// Anti-aliased disc: coverage by 8×8 supersampling.
+    fn disc(size: u32, cx: f64, cy: f64, r: f64) -> Raster {
+        let mut img = Raster::filled(size, size, [255, 255, 255, 255]);
+        for y in 0..size {
+            for x in 0..size {
+                let mut inside = 0;
+                for sy in 0..8 {
+                    for sx in 0..8 {
+                        let px = x as f64 + (sx as f64 + 0.5) / 8.0;
+                        let py = y as f64 + (sy as f64 + 0.5) / 8.0;
+                        if (px - cx).powi(2) + (py - cy).powi(2) <= r * r {
+                            inside += 1;
+                        }
+                    }
+                }
+                let v = 255 - (inside * 255 / 64) as u8;
+                img.set(x, y, [v, v, v, 255]);
+            }
+        }
+        img
+    }
 
     #[test]
-    fn stub_traces_a_square() {
+    fn square_is_four_nodes() {
         let mut img = Raster::filled(16, 16, [255, 255, 255, 255]);
         for y in 4..12 {
             for x in 4..12 {
@@ -129,15 +140,119 @@ mod tests {
         }
         let out = trace(&img, &Params::default());
         assert_eq!(out.stats.paths, 1);
+        assert_eq!(out.stats.nodes, 4, "{}", out.svg);
         assert_eq!(out.stats.colors, 1);
         assert!(out.svg.contains("viewBox=\"0 0 16 16\""));
         assert!(out.svg.contains("#000000"));
+        let bbox = out.scene.shapes[0].path.bounding_box();
+        assert!((bbox.x0 - 4.0).abs() < 1e-6 && (bbox.x1 - 12.0).abs() < 1e-6, "{bbox:?}");
     }
 
     #[test]
-    fn stub_on_blank_image_is_empty() {
+    fn blank_image_is_empty() {
         let img = Raster::filled(8, 8, [255, 255, 255, 255]);
         let out = trace(&img, &Params::default());
         assert_eq!(out.stats.paths, 0);
+    }
+
+    #[test]
+    fn circle_is_few_nodes_and_subpixel_accurate() {
+        let (cx, cy, r) = (64.0, 64.0, 40.0);
+        let img = disc(128, cx, cy, r);
+        let out = trace(&img, &Params { fit_accuracy: 0.2, ..Params::default() });
+        assert_eq!(out.stats.paths, 1);
+        assert!(out.stats.nodes <= 8, "{} nodes: {}", out.stats.nodes, out.svg);
+        // Walk the path densely and measure radial error.
+        let path = &out.scene.shapes[0].path;
+        let mut worst: f64 = 0.0;
+        for seg in path.segments() {
+            for i in 0..=50 {
+                let p = seg.eval(i as f64 / 50.0);
+                let d = ((p.x - cx).powi(2) + (p.y - cy).powi(2)).sqrt();
+                worst = worst.max((d - r).abs());
+            }
+        }
+        assert!(worst < 0.25, "max radial error {worst:.3} px");
+    }
+
+    #[test]
+    fn ring_has_two_loops_with_opposite_winding() {
+        let mut img = disc(96, 48.0, 48.0, 36.0);
+        let hole = disc(96, 48.0, 48.0, 18.0);
+        for i in (0..img.data.len()).step_by(4) {
+            let v = 255 - hole.data[i];
+            // Hole: where the inner disc is dark, make the pixel light.
+            img.data[i] = img.data[i].max(v);
+            img.data[i + 1] = img.data[i];
+            img.data[i + 2] = img.data[i];
+        }
+        let out = trace(&img, &Params::default());
+        let els = out.scene.shapes[0].path.elements();
+        let moves = els.iter().filter(|e| matches!(e, PathEl::MoveTo(_))).count();
+        assert_eq!(moves, 2, "{}", out.svg);
+        // Signed area of the whole path: outer minus hole.
+        let area = out.scene.shapes[0].path.area().abs();
+        let expect = std::f64::consts::PI * (36.0f64.powi(2) - 18.0f64.powi(2));
+        assert!((area - expect).abs() / expect < 0.02, "area {area:.1} vs {expect:.1}");
+    }
+
+    #[test]
+    fn thin_line_survives() {
+        let mut img = Raster::filled(40, 20, [255, 255, 255, 255]);
+        for x in 5..35 {
+            img.set(x, 10, [0, 0, 0, 255]);
+        }
+        let out = trace(&img, &Params { min_area: 1, ..Params::default() });
+        assert_eq!(out.stats.paths, 1);
+        assert_eq!(out.stats.nodes, 4, "{}", out.svg);
+        let bbox = out.scene.shapes[0].path.bounding_box();
+        assert!((bbox.height() - 1.0).abs() < 1e-6 && (bbox.width() - 30.0).abs() < 1e-6, "{bbox:?}");
+    }
+
+    #[test]
+    fn speckles_are_dropped() {
+        let mut img = Raster::filled(32, 32, [255, 255, 255, 255]);
+        for y in 8..24 {
+            for x in 8..24 {
+                img.set(x, y, [0, 0, 0, 255]);
+            }
+        }
+        img.set(2, 2, [0, 0, 0, 255]);
+        img.set(30, 30, [0, 0, 0, 255]);
+        img.set(31, 30, [0, 0, 0, 255]);
+        let out = trace(&img, &Params::default());
+        assert_eq!(out.stats.nodes, 4, "{}", out.svg);
+    }
+
+    #[test]
+    fn noise_never_panics_and_paths_close() {
+        let mut seed = 0x1234_5678u32;
+        for size in [1u32, 2, 3, 7, 16, 33] {
+            let mut img = Raster::filled(size, size, [255, 255, 255, 255]);
+            for y in 0..size {
+                for x in 0..size {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    let v = (seed % 256) as u8;
+                    img.set(x, y, [v, v, v, (seed >> 8) as u8 | 128]);
+                }
+            }
+            let out = trace(&img, &Params { min_area: 1, ..Params::default() });
+            for s in &out.scene.shapes {
+                let els = s.path.elements();
+                assert!(matches!(els.last(), Some(PathEl::ClosePath)));
+                for el in els {
+                    for p in match *el {
+                        PathEl::MoveTo(p) | PathEl::LineTo(p) => vec![p],
+                        PathEl::QuadTo(a, p) => vec![a, p],
+                        PathEl::CurveTo(a, b, p) => vec![a, b, p],
+                        PathEl::ClosePath => vec![],
+                    } {
+                        assert!(p.x.is_finite() && p.y.is_finite());
+                    }
+                }
+            }
+        }
     }
 }
