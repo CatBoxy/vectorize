@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cli", "crates/bench"]
-# crates/wasm joins once M5 starts; it needs the wasm32 target installed.
+members = ["crates/core", "crates/cli", "crates/bench", "crates/wasm"]
+# crates/wasm builds natively too (its tests); `rustup target add wasm32-unknown-unknown` for the real thing.
 
 [workspace.package]
 version = "0.1.0"
@@ -27,3 +27,12 @@ lto = "thin"
 [profile.bench-fast]
 inherits = "release"
 debug = 0
+
+# The browser build (M5): `wasm-pack build crates/wasm --target web --profile wasm-release`.
+# Fat LTO and one codegen unit for size; abort on panic (wasm32 cannot unwind anyway).
+[profile.wasm-release]
+inherits = "release"
+debug = 0
+lto = "fat"
+codegen-units = 1
+panic = "abort"

@@ -22,6 +22,7 @@ pub mod contour;
 pub mod coverage;
 pub mod curve;
 pub mod decompose;
+pub mod dumps;
 pub mod fit;
 pub mod graph;
 pub mod mix;
@@ -35,6 +36,7 @@ pub mod regularity;
 pub mod scene;
 pub mod svg;
 
+pub use dumps::StageDumps;
 pub use params::Params;
 pub use raster::Raster;
 pub use scene::{Fill, Scene, Shape};
@@ -46,7 +48,8 @@ pub struct Stats {
     pub nodes: usize,
     pub colors: usize,
     pub svg_bytes: usize,
-    /// Wall time per pipeline stage, in order. Zeros on wasm32.
+    /// Wall time per pipeline stage, in order. Zeros on wasm32 unless the
+    /// host installed a clock with [`set_time_source`].
     #[serde(default)]
     pub stage_ms: Vec<(String, f64)>,
 }
@@ -61,6 +64,12 @@ pub struct Traced {
 
 /// Trace a raster image into an SVG scene.
 pub fn trace(img: &Raster, params: &Params) -> Traced {
+    trace_with(img, params, None)
+}
+
+/// [`trace`], and fill `dumps` with the inspector's stage dumps (PLAN.md
+/// M5) when one is given.
+pub fn trace_with(img: &Raster, params: &Params, mut dumps: Option<&mut StageDumps>) -> Traced {
     let mut clock = StageClock::start();
     // Pixel art (PLAN.md M4): trace a nearest-neighbour upscale, where every
     // source pixel is a crisp block, and scale the result back.
@@ -74,13 +83,16 @@ pub fn trace(img: &Raster, params: &Params) -> Traced {
         img
     };
     let mut scene = match params.mode {
-        params::Mode::BlackAndWhite => bw::trace_bw(src, params, &mut clock),
-        params::Mode::Grayscale | params::Mode::Color => color::trace_color(src, params, &mut clock),
+        params::Mode::BlackAndWhite => bw::trace_bw(src, params, &mut clock, dumps.as_deref_mut()),
+        params::Mode::Grayscale | params::Mode::Color => color::trace_color(src, params, &mut clock, dumps.as_deref_mut()),
     };
     if std::ptr::eq(src, img) == false {
         scene.scale(1.0 / k as f64);
         scene.width = img.width;
         scene.height = img.height;
+        if let Some(d) = dumps.as_deref_mut() {
+            d.scale(1.0 / k as f64);
+        }
     }
     finish(scene, clock)
 }
@@ -99,12 +111,32 @@ pub fn finish(scene: Scene, mut clock: StageClock) -> Traced {
     Traced { svg, stats, scene }
 }
 
-/// Per-stage wall clock. A no-op on wasm32, where `Instant` is unavailable.
+/// Per-stage wall clock. On wasm32, where `Instant` is unavailable, it reads
+/// the millisecond clock installed with [`set_time_source`], or records
+/// zeros when there is none.
 #[derive(Debug, Default)]
 pub struct StageClock {
     #[cfg(not(target_arch = "wasm32"))]
     t: Option<std::time::Instant>,
+    #[cfg(target_arch = "wasm32")]
+    t: Option<f64>,
     pub laps: Vec<(String, f64)>,
+}
+
+thread_local! {
+    static TIME_SOURCE: std::cell::Cell<Option<fn() -> f64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Install a millisecond clock (the browser's `performance.now`) for the
+/// stage timings on wasm32, which has no `Instant`. Accepted and ignored
+/// on every other target, where `Instant` is used.
+pub fn set_time_source(now_ms: fn() -> f64) {
+    TIME_SOURCE.with(|c| c.set(Some(now_ms)));
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_now() -> Option<f64> {
+    TIME_SOURCE.with(|c| c.get()).map(|f| f())
 }
 
 impl StageClock {
@@ -112,6 +144,8 @@ impl StageClock {
         Self {
             #[cfg(not(target_arch = "wasm32"))]
             t: Some(std::time::Instant::now()),
+            #[cfg(target_arch = "wasm32")]
+            t: wasm_now(),
             laps: Vec::new(),
         }
     }
@@ -126,7 +160,13 @@ impl StageClock {
             ms
         };
         #[cfg(target_arch = "wasm32")]
-        let ms = 0.0;
+        let ms = match (self.t, wasm_now()) {
+            (Some(before), Some(now)) => {
+                self.t = Some(now);
+                now - before
+            }
+            _ => 0.0,
+        };
         self.laps.push((name.to_string(), ms));
     }
 }

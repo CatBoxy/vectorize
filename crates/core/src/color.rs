@@ -2,6 +2,7 @@
 //! boundary graph → one fitted curve per boundary → one path per colour.
 
 use crate::bw::{corner_opts, polygon_opts, TANGENT_WINDOW};
+use crate::dumps::{Polygon, RegionMap, StageDumps};
 use crate::fit::FitOpts;
 use crate::graph::Graph;
 use crate::palette::{self, PaletteOpts};
@@ -16,7 +17,7 @@ pub const MERGE_DIST: f32 = 0.04;
 /// A pixel with a 4-neighbour further than this in OKLab is an edge pixel.
 pub const EDGE_CONTRAST: f32 = 0.03;
 
-pub fn trace_color(img: &Raster, params: &Params, clock: &mut StageClock) -> Scene {
+pub fn trace_color(img: &Raster, params: &Params, clock: &mut StageClock, mut dumps: Option<&mut StageDumps>) -> Scene {
     let mut scene = Scene::new(img.width, img.height);
     if img.width == 0 || img.height == 0 {
         return scene;
@@ -59,6 +60,11 @@ pub fn trace_color(img: &Raster, params: &Params, clock: &mut StageClock) -> Sce
         pal.lab.get(a as usize).zip(pal.lab.get(b as usize)).map_or(0.0, |(x, y)| x.dist(*y))
     });
     clock.lap("regions");
+    if let Some(d) = dumps.as_deref_mut() {
+        d.palette = pal.rgb.clone();
+        d.background = pal.background;
+        d.regions = Some(RegionMap { width: reg.width as u32, height: reg.height as u32, id: reg.id.clone(), color: reg.color.clone() });
+    }
     let mut g = Graph::build(&reg);
     clock.lap("graph");
     let o = FitOpts {
@@ -71,6 +77,9 @@ pub fn trace_color(img: &Raster, params: &Params, clock: &mut StageClock) -> Sce
     let prim = crate::primitives::PrimOpts::new(accuracy);
     g.fit(&reg, &mm, &polygon_opts(params), &corner_opts(params), &o, &ropts, params.primitives.then_some(&prim));
     clock.lap("fit");
+    if let Some(d) = dumps.as_deref_mut() {
+        d.polygons = g.edges.iter().map(|e| Polygon::from_points(&e.poly, e.closed)).collect();
+    }
     let faces = g.faces(&reg);
     let skip_bg = if params.ignore_background { pal.background } else { None };
     let mut shapes: Vec<(u16, Path)> = Vec::new();
