@@ -12,8 +12,8 @@ for the literature.
 | `crates/core` | Pure tracing pipeline (`vectorize_core::trace`) |
 | `crates/cli` | `vectorize in.png -o out.svg` |
 | `crates/bench` | Benchmark harness: corpus, metrics, baselines, report |
-| `crates/wasm` | WASM wrapper (M5) |
-| `web/` | Next.js app: product UI + the Arena review game (M5 / MA) |
+| `crates/wasm` | wasm-bindgen wrapper: `trace(bytes, params_json)` → `{ svg, stats, stage_dumps? }`, and the PDF module |
+| `web/` | Next.js app: the product UI (M5); the Arena review game (MA) is not built yet |
 | `corpus/` | Benchmark images (sources fetched by `corpus/fetch.sh`, not committed) |
 
 ## Bench quickstart
@@ -68,9 +68,68 @@ the pixels around a point. For experiments, `VECTORIZE_REG_SKIP=axis,junction,pa
 turns regularity rules off, `VECTORIZE_CLASSIFIER=m3` restores the M3 corner test and
 `VECTORIZE_POLY_W=acc,cont` overrides the polygon cost weights.
 
+## WASM
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo build --target wasm32-unknown-unknown -p vectorize-wasm     # compile check, no features needed
+wasm-pack build crates/wasm --target web --profile wasm-release --out-dir pkg     -- --no-default-features --features tracer
+wasm-pack build crates/wasm --target web --profile wasm-release --out-dir pkg-pdf -- --no-default-features --features pdf
+```
+
+`crates/wasm` exports `trace(bytes, params_json)` for PNG or JPEG bytes and `trace_rgba(width, height,
+rgba, params_json)` for pixels the browser decoded itself. Both return `{ svg, stats, stage_dumps? }`
+(`stage_dumps` when the params JSON carries `"dumps": true`: palette, region map as RGBA pixels, polygon
+vertices per boundary chain) or `{ error: { code, message } }` on bad input (`decode`, `too_large`,
+`params`), never a thrown exception. A panic in the core still traps the instance, because wasm32 cannot
+unwind: the hook logs it to the console and keeps the message for `last_panic()`, and the web app's
+worker reports it and is replaced. `svg_to_pdf(svg)` is in the second module (`pkg-pdf`). Stage
+timings in `stats.stage_ms` come from `performance.now()` through `vectorize_core::set_time_source`.
+
+Sizes (wasm-pack 0.15, wasm-bindgen 0.2.129, wasm-opt 117 `-O3`, the `wasm-release` profile: fat LTO,
+one codegen unit, `panic = "abort"`):
+
+| module | raw | gzip -9 |
+|---|---|---|
+| tracer (`pkg`) | 821 KB | 341 KB |
+| PDF exporter (`pkg-pdf`: svg2pdf 0.13 without text, images or filters) | 705 KB | 306 KB |
+| both in one module | 1,421 KB | 594 KB |
+
+The budget (PLAN.md M5) is 400 KB gzipped: the tracer fits, the two together do not, so the PDF exporter
+is a separate module the app fetches on first use. `-Os`, `-Oz` and `-O4` are all within 1% of `-O3` and
+`opt-level = 3` was kept for speed. The image crate is built with only its `png` and `jpeg` features;
+its defaults pull in rayon and codecs that do not build for wasm32.
+
+## Web app
+
+`web/` is the product page (Next.js 16, App Router): drop, paste or fetch an image, trace it in a Web
+Worker, compare the result side by side, as an overlay or behind a wipe, with a node overlay and zoom
+to 800%, inspect the pipeline's stage dumps, and export SVG, PNG or PDF. Nothing leaves the browser.
+
+```sh
+# Node >= 20.9 (24.11 was already installed here; otherwise `winget install OpenJS.NodeJS.LTS`)
+cd web
+npm install
+npm run build:wasm            # copies crates/wasm/pkg and pkg-pdf into public/wasm (add `-- --build` to run wasm-pack first)
+npm run dev                   # http://localhost:3000
+npm run build                 # production build, includes the type check
+```
+
+The worker loads `/wasm/vectorize_wasm.js` once and keeps the current image; slider changes re-trace
+after 150 ms of quiet, with one trace in flight and only the latest one queued. Inputs over 2048 px on
+the long edge are downscaled, with a warning in the status bar. `public/wasm` is a build output and is
+not committed: a deployment (Vercel, root directory `web`) has to run `npm run build:wasm -- --build`
+with Rust, the wasm32 target and wasm-pack installed, or commit the two packages. In the Claude desktop
+app, `preview_start` with the `vectorize-web` entry of `dev/.claude/launch.json` serves it on port 3001.
+
 ## Windows notes
 
 The workspace builds on the `x86_64-pc-windows-gnu` toolchain without Visual Studio
 (`rustup-init -y --default-host x86_64-pc-windows-gnu --profile minimal`). That toolchain ships no
 assembler, so crates using `windows-sys` raw-dylib imports fail to link; the workspace disables clap's
 `color` feature for that reason. Potrace and VTracer are Linux-only baselines here.
+
+`cargo install wasm-pack` fails on that toolchain for the same reason (it compiles `windows-sys`). The
+prebuilt `wasm-pack-v0.15.0-x86_64-pc-windows-msvc.tar.gz` from the wasm-pack GitHub releases works:
+drop `wasm-pack.exe` into `~/.cargo/bin`. It downloads wasm-bindgen and binaryen (`wasm-opt`) by itself
+into `%LOCALAPPDATA%\.wasm-pack`.

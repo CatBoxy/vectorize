@@ -9,3 +9,9 @@
 web/node_modules/
 web/.next/
 web/.env*.local
+# Build outputs: wasm-pack packages and their copies in the web app.
+/crates/wasm/pkg*/
+web/public/wasm/
+web/public/samples/
+web/next-env.d.ts
+web/tsconfig.tsbuildinfo

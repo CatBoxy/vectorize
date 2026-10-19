@@ -35,6 +35,8 @@ pub struct Edge {
     pub start: Point,
     pub end: Point,
     pub els: Vec<El>,
+    /// The polygon stage's vertices, kept for the inspector (PLAN.md M5).
+    pub poly: Vec<Point>,
 }
 
 pub struct Graph {
@@ -202,6 +204,7 @@ impl Graph {
             start: Point::new(x0 as f64, y0 as f64),
             end: Point::new(x as f64, y as f64),
             els: Vec::new(),
+            poly: Vec::new(),
         });
     }
 
@@ -349,6 +352,7 @@ impl Graph {
         let mut rg = regularity::Reg::default();
         let mut junction_ids: HashMap<(i32, i32), usize> = HashMap::new();
         let mut plans: Vec<Plan> = Vec::with_capacity(self.edges.len());
+        let mut polys: Vec<Vec<Point>> = Vec::with_capacity(self.edges.len());
         let dbg_prims = std::env::var("VECTORIZE_DEBUG").as_deref() == Ok("prims");
         for (e, c) in self.edges.iter().zip(chains.iter_mut()) {
             if !e.closed {
@@ -364,6 +368,7 @@ impl Graph {
             let dirs: Vec<u8> = idx.iter().map(|&k| c.dirs[k]).collect();
             if e.closed {
                 let (verts, po) = polygon::polygonize_with(&pts, &dirs, popts);
+                polys.push(verts.clone());
                 let po: Vec<usize> = po.into_iter().map(|j| idx[j]).collect();
                 let n = c.pts.len();
                 if verts.len() < 3 || pts.len() < 3 {
@@ -429,6 +434,7 @@ impl Graph {
                 plans.push(Plan::Runs { ids, runs, closed: true });
             } else {
                 let (verts, po) = polygon::polygonize_open_with(&pts, &dirs, popts);
+                polys.push(verts.clone());
                 let po: Vec<usize> = po.into_iter().map(|j| idx[j]).collect();
                 let m = verts.len();
                 let (start, end) = (c.pts[0], *c.pts.last().unwrap());
@@ -473,6 +479,9 @@ impl Graph {
                 }
                 plans.push(Plan::Runs { ids, runs, closed: false });
             }
+        }
+        for (e, p) in self.edges.iter_mut().zip(polys) {
+            e.poly = p;
         }
         // Shapes for the regulariser: the anchor cycle of every face.
         for cycles in self.faces(reg) {

@@ -1,0 +1,35 @@
+[package]
+name = "vectorize-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Browser entry point: trace(bytes, params_json) -> { svg, stats, stage_dumps? }"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# One crate, two modules (README.md "WASM"): the tracer, and the PDF exporter
+# that the app fetches only when someone exports a PDF. Together they would be
+# 594 KB gzipped, over the 400 KB budget; apart they are 341 KB and 254 KB.
+#   wasm-pack build crates/wasm --target web --profile wasm-release --out-dir pkg     -- --no-default-features --features tracer
+#   wasm-pack build crates/wasm --target web --profile wasm-release --out-dir pkg-pdf -- --no-default-features --features pdf
+[features]
+default = ["tracer"]
+tracer = ["dep:image"]
+# svg2pdf through usvg without text, images or filters: the tracer only
+# emits filled paths.
+pdf = ["dep:svg2pdf"]
+
+[dependencies]
+vectorize-core = { path = "../core" }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+serde-wasm-bindgen = "0.6"
+console_error_panic_hook = "0.1"
+image = { workspace = true, optional = true }
+svg2pdf = { version = "0.13", default-features = false, optional = true }
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O3"]

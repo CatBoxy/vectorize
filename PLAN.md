@@ -523,6 +523,65 @@ What M4 ended up as, and where it departs from the recipe above:
   Looked at by eye: the 20 worst images of the M4 report (by wrong-pixel %, contact sheet of input / trace / ΔE heat) are all 64 px, nineteen of them colour emoji (mostly the JPEG copies) plus the Starbucks logo. Every trace reads as the right picture, with the right colours, no seams and nothing missing; the error heat sits on the 1–2 px dark outlines that every emoji has at that size and on the dartboard's concentric 1 px rings (671 nodes, the hardest image in the corpus), where sub-pixel placement and JPEG ringing dominate. None of them is an M4 failure class; they are the resolution limit, and M6's aliased-input work is where they belong.
 
 
+What M5 ended up as, and where it departs from the recipe above:
+- `crates/wasm` (wasm-bindgen, `wasm-pack build --target web`): `trace(bytes, params_json)` for PNG and
+  JPEG bytes and `trace_rgba(width, height, rgba, params_json)` for pixels the browser decoded, both
+  returning `{ svg, stats, stage_dumps? }` or `{ error: { code, message } }` (`decode`, `too_large`,
+  `params`), never a thrown exception; `stage_dumps` comes back when the params JSON has `"dumps": true`.
+  A panic in the core cannot be caught on wasm32 (no unwinding): it traps the instance and the call throws
+  a RuntimeError on the JavaScript side. The panic hook logs it and keeps the message for `last_panic()`;
+  the worker reports it as a `panic` error and the page replaces the worker and re-sends the image. Stage
+  timings work in the browser: the module installs `performance.now()` as the core's clock
+  (`set_time_source`).
+- Size: the tracer alone is 821 KB raw, 341 KB gzipped (wasm-pack 0.15, wasm-opt 117 `-O3`, fat LTO, one
+  codegen unit, panic=abort; `-Oz` saves under 1%). With svg2pdf compiled in it is 1,421 KB / 594 KB, over
+  the 400 KB budget, so the crate has two feature sets, `tracer` (default) and `pdf`, built as two packages:
+  the PDF module (705 KB / 306 KB gzipped, usvg without text, images or filters) is fetched the first time
+  someone exports a PDF. svg2pdf 0.13 builds for wasm32 unchanged.
+- Speed, measured inside the worker in Chromium (the desktop app's browser pane) on the Windows 10
+  machine: the 1024 px Simple Icons Coca-Cola logo traces in 380 ms the first time (JIT tier-up included)
+  and 244 ms warm (palette 25, unmix 6, regions 62, graph 41, fit 95, assemble 6, emit 1 ms inside the
+  core; the rest is PNG decoding and the crossing to JavaScript); a 512 px OpenMoji emoji in 148 ms first,
+  80 ms warm. The native bench averages 206 ms at 1024 px, so wasm runs at roughly 1.2–1.8× native. The
+  1 s target holds without any work on it.
+- Web app (`web/`, Next.js 16 App Router on Turbopack, no UI library): the whole page is the drop zone;
+  paste takes an image or a URL; the URL field fetches from the page, and a CORS refusal says so and
+  suggests saving the file. Decoding is the browser's (`createImageBitmap`): a PNG within the cap goes to
+  the module as its own bytes, a JPEG goes through a canvas so EXIF orientation applies to the traced
+  pixels as to the shown ones, and WebP, GIF and BMP go the same way. Inputs over 2048 px on the long edge
+  are downscaled with a warning. One worker loads the module once and keeps the image; slider changes
+  re-trace after 150 ms of quiet, one trace in flight and only the latest queued. Controls: preset (the
+  four M4 presets; their values are mirrored in the sliders and the preset name is still sent, so colour
+  merge and upscale come from the core), Mode, Colours (auto or N), Detail (0–100 mapped to the polygon
+  tolerance 2 → 0.1 px on a log scale, fit accuracy 1.75× that), Corners, Noise (px²), Method, Snap curves
+  to lines, Ignore white; Regularity, primitives and the B&W threshold under "advanced". Views: side by
+  side, overlay with opacity, wipe (slider and line), node overlay (the SVG path data parsed; a node is a
+  corner when its incoming and outgoing tangents differ by more than 12°, arcs included; cubic handles
+  optional), wheel zoom about the cursor up to 800%, drag to pan, fit and 100%.
+- Inspector: the core had no dump hooks, so the cheap ones were added (`trace_with`, `StageDumps`):
+  palette swatches with the background marked, the region map (one hashed colour per region, shipped as
+  RGBA pixels and drawn on a pixelated canvas; for the pixel-art preset it is the 4× grid), the polygon
+  vertices of every boundary chain (`graph::Edge` now keeps them), and the per-stage milliseconds. Not
+  dumped: the coverage/mix field and the boundary graph's sub-pixel points (large, and only readable with
+  a dedicated viewer), and the fitted curves, which are the SVG itself; the node overlay is their view.
+- Export: SVG file and copy to clipboard (the writer's output as is, no extra optimiser pass), PNG at
+  0.5–8× through a canvas, PDF through the second module. The footer says no accounts, no uploads, no
+  analytics, and none were added, not even the page counter the recipe allowed.
+- Not done: the "stranger in under 30 seconds" exit criterion is unmeasured (nobody but the author has
+  used it); working offline after the first load (a service worker, from the v1 definition of done); the
+  Arena (MA); a deployment. Deploying to Vercel needs the project's root directory set to `web`, Node 20+,
+  and the wasm packages at build time: either committed under `web/public/wasm` (1.5 MB of binaries per
+  rebuild) or built in Vercel's install step (install rustup, the wasm32 target and wasm-pack, then
+  `npm run build:wasm -- --build`). `/wasm/*` already gets immutable cache headers from `next.config.ts`,
+  `next build` passes locally with the type check, and there are no environment variables or API routes.
+- Found on the way: `cargo install wasm-pack` fails on the GNU toolchain (it compiles windows-sys); the
+  prebuilt MSVC binary works and fetches wasm-bindgen and binaryen itself. wasm-pack 0.15 ignores
+  `[package.metadata.wasm-pack.profile.<custom>]` but still runs wasm-opt for a `--profile` build.
+  Turbopack handles `new Worker(new URL("./x.ts", import.meta.url))` and a `turbopackIgnore` dynamic import
+  of the glue from `public/` without configuration. The desktop app's browser pane is 800 px wide, which is
+  how a toolbar overflow (the page scrolled sideways when a button out of view took focus) was caught.
+
+
 1. `rustup update`; `cargo install wasm-pack vtracer resvg`; `sudo apt install potrace`.
 2. `cargo new --lib crates/core`, workspace Cargo.toml, `cargo add kurbo` in core.
 3. Corpus: script that downloads Simple Icons and OpenMoji SVGs, rasterizes with resvg at the

@@ -2,6 +2,7 @@
 //! sub-pixel contours → optimal polygon → corner classification → curve
 //! fitting → one filled path per image in the mean foreground colour.
 
+use crate::dumps::{Polygon, RegionMap, StageDumps};
 use crate::params::CurveFit;
 use crate::scene::Path;
 use crate::{contour, coverage, curve, decompose, fit, polygon, primitives, regularity, Fill, Params, Raster, Scene, Shape, StageClock};
@@ -16,7 +17,7 @@ pub const OPT_TOLERANCE: f64 = 0.2;
 /// Half-width of the tangent estimation window, px of arc length.
 pub const TANGENT_WINDOW: f64 = 1.0;
 
-pub fn trace_bw(img: &Raster, params: &Params, clock: &mut StageClock) -> Scene {
+pub fn trace_bw(img: &Raster, params: &Params, clock: &mut StageClock, dumps: Option<&mut StageDumps>) -> Scene {
     let mut scene = Scene::new(img.width, img.height);
     if img.width == 0 || img.height == 0 {
         return scene;
@@ -49,6 +50,22 @@ pub fn trace_bw(img: &Raster, params: &Params, clock: &mut StageClock) -> Scene 
         })
         .collect();
     clock.lap("polygon");
+    if let Some(d) = dumps {
+        // The inspector's view of this mode: paper and ink as a two-entry
+        // palette, the binarised bitmap as the region map, one polygon per
+        // contour.
+        let fg = foreground_color(img, &bm);
+        d.palette = vec![[255, 255, 255], [fg[0], fg[1], fg[2]]];
+        d.background = Some(0);
+        let mut id = Vec::with_capacity(bm.width * bm.height);
+        for y in 0..bm.height as i32 {
+            for x in 0..bm.width as i32 {
+                id.push(bm.get(x, y) as u32);
+            }
+        }
+        d.regions = Some(RegionMap { width: bm.width as u32, height: bm.height as u32, id, color: vec![0, 1] });
+        d.polygons = polygons.iter().map(|(verts, _)| Polygon::from_points(verts, true)).collect();
+    }
     let dbg = std::env::var("VECTORIZE_DEBUG").is_ok();
     let mut bez = Path::new();
     let accuracy = params.fit_accuracy.clamp(0.02, 4.0);
